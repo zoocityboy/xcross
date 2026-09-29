@@ -223,10 +223,18 @@ abstract final class Pymd {
 
   /// Launch [bundleId] suspended via DVT ProcessControl, returning the device
   /// PID.
+  ///
+  /// `dvt launch` transiently fails with `Failed to launch process` often
+  /// enough (the same flake hits `flutter run`) that a single attempt is not
+  /// sufficient. Retries [maxAttempts] times with a linear backoff, but only
+  /// for transient failures — permanent rejections (background launch while
+  /// locked, missing DDI, device not found) fail immediately.
   static Future<int> launchSuspended({
     required List<String> deviceArgs,
     required String bundleId,
     required List<String> appArguments,
+    int maxAttempts = 3,
+    Future<void> Function(Duration)? delay,
   }) async {
     final joined = ProcessRunner.commandLine(bundleId, appArguments);
     final args = [
@@ -239,17 +247,59 @@ abstract final class Pymd {
       '--',
       joined,
     ];
-    final result = await run(args);
-    // stdout line: "Process launched with pid 12345"
-    final match = _processLaunchedPidPattern.firstMatch(result.stdout);
-    if (match != null) {
-      final pid = int.tryParse(match.group(1)!);
-      if (pid != null) return pid;
+    late TunnelError lastError;
+    for (var attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        final result = await run(args);
+        // stdout line: "Process launched with pid 12345"
+        final match = _processLaunchedPidPattern.firstMatch(result.stdout);
+        if (match != null) {
+          final pid = int.tryParse(match.group(1)!);
+          if (pid != null) return pid;
+        }
+        lastError = TunnelError(
+          'pymobiledevice3: expected "Process launched with pid <N>" in '
+          'stdout, got: ${result.stdout}',
+        );
+      } on TunnelError catch (e) {
+        lastError = e;
+      }
+      final failure = lastError;
+      if (attempt < maxAttempts && isTransientLaunchError(failure)) {
+        Log.logTrace(
+          'dvt launch attempt $attempt/$maxAttempts failed transiently, '
+          'retrying: $lastError',
+        );
+        await (delay ?? Future.delayed)(
+          Duration(seconds: attempt),
+        );
+        continue;
+      }
+      break;
     }
-    throw TunnelError(
-      'pymobiledevice3: expected "Process launched with pid <N>" in stdout, '
-      'got: ${result.stdout}',
-    );
+    throw lastError;
+  }
+
+  /// Whether a launch failure is worth retrying.
+  ///
+  /// Transient: the DVT service raced install/debugserver startup
+  /// (`Failed to launch process`), the tunnel hiccuped (timeout, connection
+  /// reset), or the pid line was missing despite a zero exit. Permanent:
+  /// background-launch rejection (locked device), unmounted DDI, unknown
+  /// device/bundle — retrying those only wastes time.
+  static bool isTransientLaunchError(Object error) {
+    final details = error.toString();
+    if (details.contains('Background launch requested')) return false;
+    if (details.contains('Developer Disk Image not mounted')) return false;
+    if (details.contains('Could not find device')) return false;
+    if (details.contains('No device found')) return false;
+    if (details.contains('App is not installed')) return false;
+    if (details.contains('not installed')) return false;
+    return details.contains('Failed to launch process') ||
+        details.contains('Connection reset') ||
+        details.contains('Connection refused') ||
+        details.contains('timed out') ||
+        details.contains('expected "Process launched with pid');
   }
 
   /// Return set of installed bundle identifiers.
