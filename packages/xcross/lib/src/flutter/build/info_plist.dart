@@ -21,6 +21,12 @@ abstract final class InfoPlist {
   static String setPlistString(String plistXml, String key, String value) =>
       _setPlistKey(plistXml, key, value);
 
+  /// Insert a raw plist [fragment] before the closing `</dict>` of the root
+  /// dict. Used for multi-key fragments (`CFBundleIcons`, `UILaunchImages`)
+  /// that [setPlistString] cannot express.
+  static String insertFragment(String plistXml, String fragment) =>
+      _insertBeforeEnd(plistXml, fragment);
+
   /// Read `CFBundleIdentifier`, or null when absent.
   static String? readBundleIdentifier(String plistXml) {
     final match = RegExp(

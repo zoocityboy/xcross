@@ -3,6 +3,7 @@ import 'dart:io';
 import 'package:cli_kit/cli_kit.dart';
 import 'package:darwin_sdk_kit/darwin_sdk_kit.dart';
 import 'package:path/path.dart' as p;
+import 'package:xcross/src/dn/dn_asset_catalog.dart';
 import 'package:xcross/src/dn/dn_build_options.dart';
 import 'package:xcross/src/dn/dn_engine_cache.dart';
 import 'package:xcross/src/dn/dn_native_deps.dart';
@@ -301,12 +302,20 @@ abstract final class DnPackOperation {
         projectRoot: projectRoot,
         bundleDir: tmp.path,
       );
+      // actool replacement: compile the asset catalog (icons + launch
+      // images) without macOS; the resulting plist keys are merged in
+      // _writeInfoPlist below.
+      final compiledAssets = await DnAssetCatalog.compile(
+        projectRoot: projectRoot,
+        bundleDir: tmp.path,
+      );
       await _writeInfoPlist(
         projectRoot: projectRoot,
         bundleDir: tmp.path,
         bundleId: bundleId,
         versions: versions,
         deploymentTarget: deploymentTarget,
+        compiledAssets: compiledAssets,
       );
 
       final dest = p.join(projectRoot, 'build', 'xcross-ios', '$appName.app');
@@ -326,6 +335,7 @@ abstract final class DnPackOperation {
     required String bundleId,
     required IosBundleVersions versions,
     required IosDeploymentTarget deploymentTarget,
+    DnCompiledAssets? compiledAssets,
   }) async {
     var plistXml = _loadPlistTemplate(projectRoot);
     plistXml = InfoPlist.expandXmlVars(
@@ -351,6 +361,20 @@ abstract final class DnPackOperation {
     );
     plistXml = InfoPlist.applyDebugVmServiceDiscovery(plistXml);
     plistXml = InfoPlist.stripUnsatisfiableStoryboards(plistXml, bundleDir);
+    if (compiledAssets != null) {
+      if (compiledAssets.hasIcons) {
+        plistXml = InfoPlist.insertFragment(
+          plistXml,
+          DnAssetCatalog.cfbundleIconsFragment(compiledAssets.iconFiles),
+        );
+      }
+      if (compiledAssets.hasLaunchImages) {
+        plistXml = InfoPlist.insertFragment(
+          plistXml,
+          DnAssetCatalog.uiLaunchImagesFragment(compiledAssets.launchImages),
+        );
+      }
+    }
     // NOTE: no applySceneLifecycle — the DN template already declares its
     // scene manifest, and the Flutter rewrite would point the scene at a
     // `SceneDelegate` class this bundle does not contain. The scene is
