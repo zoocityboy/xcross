@@ -55,11 +55,11 @@ abstract final class DnAssetCatalog {
     if (catalog == null) return null;
 
     final iconFiles = await _compileAppIcon(catalog, bundleDir);
-    final launchImages = await _stageLaunchImages(catalog, bundleDir);
-    if (iconFiles == null && launchImages == null) return null;
+    final launchSets = await _stageLaunchImages(catalog, bundleDir);
+    if (iconFiles == null && launchSets == null) return null;
     return DnCompiledAssets(
       iconFiles: iconFiles ?? const [],
-      launchImages: launchImages ?? const [],
+      launchSets: launchSets ?? const [],
     );
   }
 
@@ -151,38 +151,48 @@ abstract final class DnAssetCatalog {
     }
   }
 
-  /// Stage launch images into the bundle; returns UILaunchImages entries.
-  static Future<List<DnLaunchImage>?> _stageLaunchImages(
+  /// Stage launch images into the bundle with scale-aware names so
+  /// `UIImage imageNamed:` scale lookup works (`<base>.png`, `<base>@2x.png`,
+  /// `<base>@3x.png`).
+  ///
+  /// Returns the staged sets (base name + available scales), or null when the
+  /// catalog has no launch imageset with files.
+  static Future<List<DnLaunchImageSet>?> _stageLaunchImages(
     String catalog,
     String bundleDir,
   ) async {
-    final entries = <DnLaunchImage>[];
+    final sets = <DnLaunchImageSet>[];
     for (final setName in ['LaunchImage', 'LaunchBackground']) {
       final setDir = p.join(catalog, '$setName.imageset');
       final manifest = File(p.join(setDir, 'Contents.json'));
       if (!manifest.existsSync()) continue;
       try {
-        final doc = jsonDecode(manifest.readAsStringSync()) as Map<String, dynamic>;
+        final doc =
+            jsonDecode(manifest.readAsStringSync()) as Map<String, dynamic>;
+        final scales = <String>[];
         for (final entry in ((doc['images'] as List?) ?? [])
             .cast<Map<String, dynamic>>()) {
           final filename = entry['filename'] as String?;
           if (filename == null || filename.isEmpty) continue;
           final source = File(p.join(setDir, filename));
           if (!source.existsSync()) continue;
-          final destName = '$setName-${p.basenameWithoutExtension(filename)}.png';
-          await source.copy(p.join(bundleDir, destName));
-          entries.add(
-            DnLaunchImage(
-              name: p.basenameWithoutExtension(destName),
-              scale: (entry['scale'] as String?) ?? '1x',
-            ),
-          );
+          final scale = (entry['scale'] as String?) ?? '1x';
+          final suffix = switch (scale) {
+            '2x' => '@2x',
+            '3x' => '@3x',
+            _ => '',
+          };
+          await source.copy(p.join(bundleDir, '$setName$suffix.png'));
+          scales.add(scale);
+        }
+        if (scales.isNotEmpty) {
+          sets.add(DnLaunchImageSet(name: setName, scales: scales));
         }
       } on Object {
         continue;
       }
     }
-    return entries.isEmpty ? null : entries;
+    return sets.isEmpty ? null : sets;
   }
 
   /// `CFBundleIcons` (+ `~ipad`) dict fragment for [iconFiles].
@@ -197,34 +207,43 @@ abstract final class DnAssetCatalog {
         '<key>CFBundleIcons~ipad</key>${dict(files)}';
   }
 
-  /// `UILaunchImages` array fragment for [images].
-  static String uiLaunchImagesFragment(List<DnLaunchImage> images) {
-    final items = StringBuffer();
-    for (final e in images) {
-      items.write('<dict><key>UILaunchImageName</key><string>${e.name}</string><key>UILaunchImageSize</key><string>{320, 480}</string><key>UILaunchImageOrientation</key><string>Portrait</string><key>UILaunchImageMinimumOSVersion</key><string>7.0</string><key>UILaunchImageScale</key><string>${e.scale}</string></dict>');
+  /// Splash image base name for `UILaunchScreen.UIImageName`: prefers the
+  /// `LaunchImage` set (full-screen splash with all scales), falling back to
+  /// `LaunchBackground` and then any staged set.
+  static String? splashImageName(List<DnLaunchImageSet> sets) {
+    for (final preferred in ['LaunchImage', 'LaunchBackground']) {
+      for (final set in sets) {
+        if (set.name == preferred) return set.name;
+      }
     }
-    return '<key>UILaunchImages</key><array>$items</array>';
+    return sets.isEmpty ? null : sets.first.name;
   }
 }
 
 /// Result of [DnAssetCatalog.compile].
 final class DnCompiledAssets {
-  const DnCompiledAssets({required this.iconFiles, required this.launchImages});
+  const DnCompiledAssets({required this.iconFiles, required this.launchSets});
 
   /// Bundle basenames for `CFBundleIconFiles`.
   final List<String> iconFiles;
 
-  /// Staged launch images for `UILaunchImages`.
-  final List<DnLaunchImage> launchImages;
+  /// Staged launch imagesets (scale-aware bundle PNGs).
+  final List<DnLaunchImageSet> launchSets;
 
   bool get hasIcons => iconFiles.isNotEmpty;
-  bool get hasLaunchImages => launchImages.isNotEmpty;
+  bool get hasLaunchImages => launchSets.isNotEmpty;
+
+  /// Base name for `UILaunchScreen.UIImageName`, or null when no launch
+  /// imageset was staged.
+  String? get splashImageName => DnAssetCatalog.splashImageName(launchSets);
 }
 
-/// One staged launch image.
-final class DnLaunchImage {
-  const DnLaunchImage({required this.name, required this.scale});
+/// One staged launch imageset: `<name>.png` / `<name>@2x.png` /
+/// `<name>@3x.png` in the bundle root, per the scales present in the
+/// imageset manifest.
+final class DnLaunchImageSet {
+  const DnLaunchImageSet({required this.name, required this.scales});
 
   final String name;
-  final String scale;
+  final List<String> scales;
 }

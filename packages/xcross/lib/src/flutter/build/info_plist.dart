@@ -27,6 +27,32 @@ abstract final class InfoPlist {
   static String insertFragment(String plistXml, String fragment) =>
       _insertBeforeEnd(plistXml, fragment);
 
+  /// Point the programmatic launch screen at [imageName]
+  /// (`UILaunchScreen.UIImageName`, iOS 14+).
+  ///
+  /// Replaces the empty `<dict/>` that [stripUnsatisfiableStoryboards] emits
+  /// when no compiled `LaunchScreen.storyboardc` exists; inserts a populated
+  /// dict when `UILaunchScreen` is absent; leaves a non-empty dict alone.
+  static String setUILaunchScreen(String plistXml, String imageName) {
+    final empty = RegExp(
+      r'<key>UILaunchScreen</key>\s*<dict\s*/>',
+    );
+    const populated =
+        '<key>UILaunchScreen</key>'
+        '<dict><key>UIImageName</key><string>{IMAGE}</string></dict>';
+    if (empty.hasMatch(plistXml)) {
+      return plistXml.replaceFirst(
+        empty,
+        populated.replaceAll('{IMAGE}', imageName),
+      );
+    }
+    if (plistXml.contains('<key>UILaunchScreen</key>')) return plistXml;
+    return _insertBeforeEnd(
+      plistXml,
+      populated.replaceAll('{IMAGE}', imageName),
+    );
+  }
+
   /// Read `CFBundleIdentifier`, or null when absent.
   static String? readBundleIdentifier(String plistXml) {
     final match = RegExp(

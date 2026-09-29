@@ -368,11 +368,13 @@ abstract final class DnPackOperation {
           DnAssetCatalog.cfbundleIconsFragment(compiledAssets.iconFiles),
         );
       }
-      if (compiledAssets.hasLaunchImages) {
-        plistXml = InfoPlist.insertFragment(
-          plistXml,
-          DnAssetCatalog.uiLaunchImagesFragment(compiledAssets.launchImages),
-        );
+      // Legacy UILaunchImages are ignored on iOS 13+ once UILaunchScreen (or
+      // UILaunchStoryboardName) is present, so the splash goes through the
+      // programmatic launch screen instead: UIImageName resolves the staged
+      // scale-aware bundle PNGs via UIImage imageNamed:.
+      final splash = compiledAssets.splashImageName;
+      if (splash != null) {
+        plistXml = InfoPlist.setUILaunchScreen(plistXml, splash);
       }
     }
     // NOTE: no applySceneLifecycle — the DN template already declares its

@@ -58,8 +58,7 @@ void main() {
       );
       expect(compiled, isNotNull);
       expect(compiled!.hasIcons, isTrue);
-      expect(compiled.hasLaunchImages, isTrue);
-      // Every icon slot exists on disk at the exact pixel size.
+      expect(compiled.hasLaunchImages, isTrue);      // Every icon slot exists on disk at the exact pixel size.
       for (final base in compiled.iconFiles) {
         final file = File(p.join(bundle.path, '$base.png'));
         expect(file.existsSync(), isTrue, reason: base);
@@ -70,9 +69,10 @@ void main() {
         expect(decoded.height, expected, reason: base);
       }
       expect(
-        File(p.join(bundle.path, 'LaunchImage-LaunchImage.png')).existsSync(),
+        File(p.join(bundle.path, 'LaunchImage.png')).existsSync(),
         isTrue,
       );
+      expect(compiled.splashImageName, 'LaunchImage');
     });
 
     test('plist fragments reference staged files', () async {
@@ -84,10 +84,7 @@ void main() {
       expect(icons, contains('CFBundleIcons'));
       expect(icons, contains('CFBundleIcons~ipad'));
       expect(icons, contains(compiled.iconFiles.first));
-      final launch =
-          DnAssetCatalog.uiLaunchImagesFragment(compiled.launchImages);
-      expect(launch, contains('UILaunchImages'));
-      expect(launch, contains('LaunchImage-LaunchImage'));
+      expect(compiled.splashImageName, 'LaunchImage');
     });
 
     test('returns null without a catalog', () async {
