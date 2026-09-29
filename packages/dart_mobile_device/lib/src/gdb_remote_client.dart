@@ -139,6 +139,8 @@ final class GdbRemoteClient {
 
   Socket? _socket;
 
+  Timer? _heartbeat;
+
   final _buffer = <int>[];
 
   final _replyController = StreamController<GdbReplyPacket>.broadcast();
@@ -163,6 +165,11 @@ final class GdbRemoteClient {
       onError: (_) => _replyController.close(),
       onDone: _replyController.close,
     );
+    // Start the heartbeat immediately: the on-device debugserver exits on
+    // ~1s of protocol idleness, and the handshake below already takes
+    // about that long over a slow tunnel. Replies to heartbeat packets
+    // are never routed to exchange completers (see _dispatchPacket).
+    startHeartbeat();
   }
 
   /// Send the no-ack handshake.
@@ -196,6 +203,33 @@ final class GdbRemoteClient {
     return reply;
   }
 
+  /// Start a periodic `qC` heartbeat that keeps the on-device debugserver
+  /// from exiting on protocol idleness.
+  ///
+  /// The device reaps an idle debugserver about a second after the last
+  /// packet, silently detaching the debugger; a debug engine created after
+  /// that refuses to start ("Cannot create a FlutterEngine instance in
+  /// debug mode without Flutter tooling or Xcode"). Started automatically
+  /// by [connect] (the handshake alone already takes ~1s over a slow
+  /// tunnel) and stopped by [stopHeartbeat] and [close].
+  ///
+  /// The `qC` replies classify as [GdbReply.other] and are never routed to
+  /// exchange completers (see [_dispatchPacket]), and no exchanges are
+  /// pending mid-session, so the heartbeat cannot disturb the session.
+  /// Best-effort: send failures are swallowed.
+  void startHeartbeat({Duration interval = const Duration(milliseconds: 400)}) {
+    stopHeartbeat();
+    _heartbeat = Timer.periodic(interval, (_) {
+      _sendFramed('qC').catchError((Object _) {});
+    });
+  }
+
+  /// Stop the heartbeat started by [startHeartbeat].
+  void stopHeartbeat() {
+    _heartbeat?.cancel();
+    _heartbeat = null;
+  }
+
   /// Send `c` (continue) without waiting for a reply.
   Future<void> resume() => _sendFramed('c');
 
@@ -209,6 +243,7 @@ final class GdbRemoteClient {
   }
 
   Future<void> close() async {
+    stopHeartbeat();
     final s = _socket;
     _socket = null;
     s?.destroy();
@@ -270,7 +305,12 @@ final class GdbRemoteClient {
 
   void _dispatchPacket(String payload) {
     final c = _exchangeCompleter;
-    if (c != null && !c.isCompleted) {
+    // Heartbeat replies (`QC...` for our own `qC` pings) never complete an
+    // exchange: a heartbeat tick may overlap a handshake round-trip, and
+    // handing the handshake the heartbeat's reply would fail it with a
+    // confusing payload. Heartbeat packets have no other legal source —
+    // `qC` is only ever sent by [startHeartbeat].
+    if (c != null && !c.isCompleted && !_isHeartbeatReply(payload)) {
       _exchangeCompleter = null;
       c.complete(payload);
       return;
@@ -279,6 +319,8 @@ final class GdbRemoteClient {
       _replyController.add(_classify(payload));
     }
   }
+
+  static bool _isHeartbeatReply(String payload) => payload.startsWith('QC');
 
   static GdbReplyPacket _classify(String payload) {
     final first = payload.isEmpty ? '' : payload[0];

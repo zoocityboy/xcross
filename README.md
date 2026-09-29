@@ -323,6 +323,8 @@ Edit it with `xcross config`, inspect it with `xcross config show`, prove it wit
 | `xcross tunnel` | Mount the Developer Disk Image + start the iOS 17+ RSD tunnel over USB |
 | `xcross tunnel --wifi` | Prepare wireless pairing, reconnect or advertise pair-host, mount DDI, and open the Wi-Fi RSD tunnel |
 | `xcross flutter run` | Build → sign → install → launch → hot reload |
+| `xcross dn build` | Build a DartNative iOS `.app` without Xcode |
+| `xcross dn run` | Build, install, and run a DartNative iOS app on a device |
 | `xcross compose setup` | Install Kotlin/Compose iOS cross-build helpers |
 | `xcross compose build` | Build a KMP iOS framework or `.app` from the current Gradle project |
 | `xcross compose run -d <device>` | Build, sign, install, and launch a runnable KMP iOS app |

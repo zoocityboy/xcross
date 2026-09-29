@@ -21,6 +21,7 @@ import 'package:xcross/src/cli/basic/setup_command.dart';
 import 'package:xcross/src/cli/basic/tunnel_command.dart';
 import 'package:xcross/src/cli/basic/update_command.dart';
 import 'package:xcross/src/cli/compose/compose_command.dart';
+import 'package:xcross/src/cli/dn/dn_command.dart';
 import 'package:xcross/src/cli/flutter/flutter_command.dart';
 import 'package:xcross/src/cli/ide/ide_command.dart';
 import 'package:xcross/src/cli/internal/xcross_runner.dart';
@@ -264,11 +265,12 @@ abstract final class XcrossCli {
         .toSet();
     final runner = XcrossRunner(
       'xcross',
-      'Build and run Flutter and Compose Multiplatform iOS apps without Xcode.',
+      'Build and run Flutter, DartNative, and Compose Multiplatform iOS apps without Xcode.',
     );
     final commands = <Command<void>>[
       FlutterCommand(),
       ComposeCommand(),
+      DnCommand(),
       TunnelCommand(),
       CleanCommand(),
       ConfigCommand(),

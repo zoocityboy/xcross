@@ -16,13 +16,15 @@ final class DoctorCheck {
   final String? path;
 }
 
-enum DoctorProjectKind { flutter, compose }
+enum DoctorProjectKind { flutter, compose, dartnative }
 
 final class DoctorProject {
   const DoctorProject(this.kind, this.root);
 
   const DoctorProject.flutter(this.root) : kind = DoctorProjectKind.flutter;
   const DoctorProject.compose(this.root) : kind = DoctorProjectKind.compose;
+  const DoctorProject.dartnative(this.root)
+    : kind = DoctorProjectKind.dartnative;
 
   final DoctorProjectKind kind;
   final String root;

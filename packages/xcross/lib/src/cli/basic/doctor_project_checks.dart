@@ -6,6 +6,8 @@ import 'package:xcross/src/cli/basic/doctor_models.dart';
 import 'package:xcross/src/compose/project/kmp_project.dart';
 import 'package:xcross/src/compose/toolchain/compose_host.dart';
 import 'package:xcross/src/compose/toolchain/compose_toolchain_resolver.dart';
+import 'package:xcross/src/dn/dn_app_resolver.dart';
+import 'package:xcross/src/dn/dn_project.dart';
 import 'package:xcross/src/errors.dart';
 import 'package:xcross/src/flutter/build/flutter_packer.dart';
 import 'package:xcross/src/flutter/models/pubspec_info.dart';
@@ -14,6 +16,9 @@ import 'package:xcross/src/package_config_resolver.dart';
 abstract final class DoctorProjectChecks {
   static DoctorProject? detect(String root) {
     if (File(p.join(root, 'pubspec.yaml')).existsSync()) {
+      if (DnProject.isDartNativeProject(root)) {
+        return DoctorProject.dartnative(root);
+      }
       return DoctorProject.flutter(root);
     }
     if (File(p.join(root, 'settings.gradle.kts')).existsSync() ||
@@ -27,6 +32,7 @@ abstract final class DoctorProjectChecks {
       switch (project.kind) {
         DoctorProjectKind.flutter => _flutter(project.root),
         DoctorProjectKind.compose => _compose(project.root),
+        DoctorProjectKind.dartnative => _dartnative(project.root),
       };
 
   static Future<List<DoctorCheck>> _flutter(String root) async {
@@ -125,4 +131,24 @@ abstract final class DoctorProjectChecks {
       problems.isEmpty
       ? const DoctorCheck.success('Compose toolchain', 'Ready.')
       : DoctorCheck.failure('Compose toolchain', problems.join(' '));
+
+  static Future<List<DoctorCheck>> _dartnative(String root) async {
+    final projectCheck = _flutterProject(root);
+    final dn = DnProject.resolveDnExecutable();
+    final dnCheck = dn == null
+        ? const DoctorCheck.failure(
+            'dn CLI',
+            'Not found. Install with '
+            '`curl -fsSL https://cdn.dartnative.com/install.sh | sh`.',
+          )
+        : DoctorCheck.success('dn CLI', 'Found', path: dn);
+    final app = DnAppResolver.findBuiltApp(root);
+    final appCheck = app == null
+        ? const DoctorCheck.warning(
+            'DartNative app',
+            'No build/xcross-ios/*.app yet; run `xcross dn build`.',
+          )
+        : DoctorCheck.success('DartNative app', 'Found', path: app);
+    return [projectCheck, dnCheck, await _flutterPackages(root), appCheck];
+  }
 }

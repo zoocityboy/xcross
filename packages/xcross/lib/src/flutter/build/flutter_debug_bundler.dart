@@ -523,7 +523,6 @@ final class FlutterDebugBundler {
       });
 
   /// Build the clang argument list for the App stub dylib.
-  @visibleForTesting
   static List<String> appStubClangArgs({
     required Toolchain toolchain,
     required String stubSource,
@@ -568,7 +567,6 @@ final class FlutterDebugBundler {
     ).writeAsStringSync(appFrameworkInfoPlist(deploymentTarget));
   }
 
-  @visibleForTesting
   static String appFrameworkInfoPlist(IosDeploymentTarget deploymentTarget) {
     return '<?xml version="1.0" encoding="UTF-8"?>\n'
         '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"'

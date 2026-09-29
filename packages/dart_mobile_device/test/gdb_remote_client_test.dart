@@ -205,6 +205,47 @@ void main() {
       expect(await firstFrame.timeout(const Duration(seconds: 2)), _frame('c'));
     });
 
+    test('heartbeat sends periodic qC frames until stopped', () async {
+      final (client, socket) = await connectClient();
+
+      final frames = <String>[];
+      final sub = _incomingFrames(socket).listen(frames.add);
+      addTearDown(sub.cancel);
+
+      client.startHeartbeat(interval: const Duration(milliseconds: 50));
+      await Future<void>.delayed(const Duration(milliseconds: 300));
+      client.stopHeartbeat();
+      final count = frames.where((f) => f == _frame('qC')).length;
+      expect(count, greaterThanOrEqualTo(2));
+
+      await Future<void>.delayed(const Duration(milliseconds: 200));
+      expect(
+        frames.where((f) => f == _frame('qC')).length,
+        count,
+        reason: 'no further heartbeats after stopHeartbeat',
+      );
+    });
+
+    test('close() stops the heartbeat', () async {
+      final (client, socket) = await connectClient();
+
+      final frames = <String>[];
+      final sub = _incomingFrames(socket).listen(frames.add);
+      addTearDown(sub.cancel);
+
+      client.startHeartbeat(interval: const Duration(milliseconds: 50));
+      await Future<void>.delayed(const Duration(milliseconds: 200));
+      expect(
+        frames.where((f) => f == _frame('qC')).length,
+        greaterThanOrEqualTo(1),
+      );
+
+      await client.close();
+      final count = frames.where((f) => f == _frame('qC')).length;
+      await Future<void>.delayed(const Duration(milliseconds: 200));
+      expect(frames.where((f) => f == _frame('qC')).length, count);
+    });
+
     test('replies stream classifies unsolicited packets', () async {
       final (client, socket) = await connectClient();
 
