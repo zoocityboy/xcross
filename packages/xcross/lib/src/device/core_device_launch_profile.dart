@@ -11,6 +11,17 @@ final class CoreDeviceLaunchProfile {
     this.arguments = const [],
   }) : _flutterRuntime = true;
 
+  /// DartNative debug (JIT) launch with hot reload.
+  ///
+  /// The DN engine is a Flutter-engine fork and accepts the same VM Service
+  /// flags, so this passes the identical runtime arguments as [flutter].
+  /// Kept as a separate constructor so call sites read as DN rather than
+  /// Flutter, and so future DN-only flags have a home.
+  const CoreDeviceLaunchProfile.dn({
+    required this.hotReload,
+    this.arguments = const [],
+  }) : _flutterRuntime = true;
+
   final List<String> arguments;
   final HotReloadConfig? hotReload;
   final bool _flutterRuntime;

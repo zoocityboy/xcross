@@ -8,8 +8,9 @@ import 'package:xcross/src/device/core_device_launch_profile.dart';
 import 'package:xcross/src/device/device_run_operation.dart';
 import 'package:xcross/src/dn/dn_app_resolver.dart';
 import 'package:xcross/src/dn/dn_build_options.dart';
+import 'package:xcross/src/dn/dn_hot_reload_setup.dart';
 import 'package:xcross/src/dn/dn_pack_operation.dart';
-import 'package:xcross/src/models/pack_result.dart';
+import 'package:xcross/src/flutter/flutter.dart';
 
 /// `xcross dn build` — build a DartNative iOS `.app` without Xcode.
 ///
@@ -98,6 +99,9 @@ final class DnRunCommand extends Command<void> {
         help: 'Discovery: attached (USB), wireless (Wi-Fi), or both.',
       )
       ..addMultiOption('app-argument', abbr: 'a', help: 'Pass arguments to the app main().')
+      ..addFlag('hot',
+          help: 'Run with support for hot reloading (debug mode only, like `dn run --hot`).',
+          defaultsTo: true)
       ..addFlag('verbose', abbr: 'v', help: 'Verbose output.', negatable: false);
   }
 
@@ -138,14 +142,43 @@ final class DnRunCommand extends Command<void> {
     }
     Log.logInfo('App', '${pack.bundleId} ${Log.dim('dartnative, attached via CoreDevice')}');
     final operation = await DeviceRunOperation.resolve();
+    // Full parity with `dn run --hot` (on by default): a persistent DN
+    // frontend_server recompiles changed sources to an incremental dill and
+    // the shared HotReloadController pushes it over DevFS, giving the same
+    // r/R workflow as Flutter. When the DN SDK pieces are missing (or
+    // --no-hot), fall back to the streaming native profile.
+    HotReloadConfig? hotReload;
+    if (argResults!['hot'] as bool) {
+      final defines = await DnBuildOptions.resolve(
+        target: argResults!['target'] as String,
+        dartDefine: argResults!['dart-define'] as List<String>,
+        dartDefineFromFile:
+            argResults!['dart-define-from-file'] as List<String>,
+        pub: argResults!['pub'] as bool,
+        buildName: argResults!['build-name'] as String?,
+        buildNumber: argResults!['build-number'] as String?,
+        flavor: argResults!['flavor'] as String?,
+      );
+      hotReload = await DnHotReloadSetup.buildHotReloadConfig(
+        target: argResults!['target'] as String,
+        dartDefines: defines.dartDefines,
+        verbose: argResults!['verbose'] as bool,
+      );
+    }
+    final profile = hotReload == null
+        ? CoreDeviceLaunchProfile.native(
+            arguments: argResults!['app-argument'] as List<String>,
+          )
+        : CoreDeviceLaunchProfile.dn(
+            hotReload: hotReload,
+            arguments: argResults!['app-argument'] as List<String>,
+          );
     await operation.run(
       pack: pack,
       selector:
           (argResults!['udid'] as String?) ?? (argResults!['device-id'] as String?),
       mode: mode,
-      launchProfile: CoreDeviceLaunchProfile.native(
-        arguments: argResults!['app-argument'] as List<String>,
-      ),
+      launchProfile: profile,
     );
   }
 }
