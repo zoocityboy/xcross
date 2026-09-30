@@ -15,6 +15,27 @@ void main() {
       expect(options.target, 'lib/main.dart');
       expect(options.pub, isTrue);
     });
+
+    test('resolve appends FLUTTER_APP_FLAVOR unless explicitly defined',
+        () async {
+      final flavored = await DnBuildOptions.resolve(
+        target: 'lib/main.dart',
+        dartDefine: [],
+        dartDefineFromFile: [],
+        pub: true,
+        flavor: 'dev',
+      );
+      expect(flavored.dartDefines, ['FLUTTER_APP_FLAVOR=dev']);
+
+      final explicit = await DnBuildOptions.resolve(
+        target: 'lib/main.dart',
+        dartDefine: ['FLUTTER_APP_FLAVOR=prod'],
+        dartDefineFromFile: [],
+        pub: true,
+        flavor: 'dev',
+      );
+      expect(explicit.dartDefines, ['FLUTTER_APP_FLAVOR=prod']);
+    });
   });
 
   group('DnPackOperation.bundleArgs', () {

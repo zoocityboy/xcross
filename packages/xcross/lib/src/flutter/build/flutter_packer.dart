@@ -292,6 +292,8 @@ final class FlutterPacker {
       entrypoint: options.target,
       dartDefines: options.dartDefines,
       flavor: options.flavor,
+      buildName: options.buildName,
+      buildNumber: options.buildNumber,
     ).build();
   }
 

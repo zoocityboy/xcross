@@ -117,15 +117,17 @@ final class DnRunCommand extends Command<void> {
       deviceConnection: connection,
     );
     final PackResult pack;
+    final DnBuildOptions? buildOptions;
     final appPath = argResults!['app-path'] as String?;
     if (appPath != null && appPath.isNotEmpty) {
+      buildOptions = null;
       pack = DnAppResolver.resolve(
         projectRoot: Directory.current.path,
         appPath: appPath,
         bundleIdOverride: argResults!['bundle-id'] as String?,
       );
     } else {
-      final options = await DnBuildOptions.resolve(
+      buildOptions = await DnBuildOptions.resolve(
         target: argResults!['target'] as String,
         dartDefine: argResults!['dart-define'] as List<String>,
         dartDefineFromFile:
@@ -136,7 +138,7 @@ final class DnRunCommand extends Command<void> {
         flavor: argResults!['flavor'] as String?,
       );
       pack = await DnPackOperation.pack(
-        options: options,
+        options: buildOptions,
         bundleIdOverride: argResults!['bundle-id'] as String?,
       );
     }
@@ -148,20 +150,25 @@ final class DnRunCommand extends Command<void> {
     // r/R workflow as Flutter. When the DN SDK pieces are missing (or
     // --no-hot), fall back to the streaming native profile.
     HotReloadConfig? hotReload;
+    // options.dartDefines already carry the derived FLUTTER_APP_FLAVOR (if
+    // any); without a fresh build there is no pack to take them from, so
+    // resolve them the same way for --app-path.
     if (argResults!['hot'] as bool) {
-      final defines = await DnBuildOptions.resolve(
-        target: argResults!['target'] as String,
-        dartDefine: argResults!['dart-define'] as List<String>,
-        dartDefineFromFile:
-            argResults!['dart-define-from-file'] as List<String>,
-        pub: argResults!['pub'] as bool,
-        buildName: argResults!['build-name'] as String?,
-        buildNumber: argResults!['build-number'] as String?,
-        flavor: argResults!['flavor'] as String?,
-      );
+      final dartDefines =
+          buildOptions?.dartDefines ??
+          (await DnBuildOptions.resolve(
+            target: argResults!['target'] as String,
+            dartDefine: argResults!['dart-define'] as List<String>,
+            dartDefineFromFile:
+                argResults!['dart-define-from-file'] as List<String>,
+            pub: argResults!['pub'] as bool,
+            buildName: argResults!['build-name'] as String?,
+            buildNumber: argResults!['build-number'] as String?,
+            flavor: argResults!['flavor'] as String?,
+          )).dartDefines;
       hotReload = await DnHotReloadSetup.buildHotReloadConfig(
         target: argResults!['target'] as String,
-        dartDefines: defines.dartDefines,
+        dartDefines: dartDefines,
         injectedDefines: pack.injectedDefines,
         verbose: argResults!['verbose'] as bool,
       );

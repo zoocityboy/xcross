@@ -60,6 +60,7 @@ final class HotReloadController {
       entrypoint: config.entrypoint,
       outputDill: config.outputDill,
       dartDefines: config.dartDefines,
+      extraSources: config.extraSources,
       initializeFromDill: File(warm).existsSync() ? warm : null,
       onTrace: Log.logTrace,
     );

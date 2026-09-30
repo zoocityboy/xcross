@@ -3,6 +3,7 @@ import 'dart:io';
 
 import 'package:cli_kit/cli_kit.dart';
 import 'package:path/path.dart' as p;
+import 'package:xcross/src/flutter/models/flutter/dart_defines.dart';
 
 /// Defines `dn build bundle` injects into every kernel compile on top of the
 /// caller's `--dart-define`s: the license from `dn config --license-key` /
@@ -29,10 +30,7 @@ abstract final class DnInjectedDefines {
       key.startsWith('FLUTTER_');
 
   /// Key part of a `KEY=value` (or bare `KEY`) define string.
-  static String keyOf(String define) {
-    final eq = define.indexOf('=');
-    return eq < 0 ? define : define.substring(0, eq);
-  }
+  static String keyOf(String define) => DartDefines.keyOf(define);
 
   // Flag boundary: ` -X` or ` --xxx` (dn's line mixes both after -D values).
   static final _flagStart = RegExp(' -(?:-?[A-Za-z])');
@@ -81,14 +79,7 @@ abstract final class DnInjectedDefines {
   static List<String> merge({
     required List<String> user,
     required List<String> injected,
-  }) {
-    final userKeys = {for (final d in user) keyOf(d)};
-    return [
-      ...user,
-      for (final d in injected)
-        if (!userKeys.contains(keyOf(d))) d,
-    ];
-  }
+  }) => DartDefines.mergeFallback(base: user, fallback: injected);
 
   /// On-disk cache so an incremental `dn build bundle` (which skips the
   /// kernel compile and prints no frontend_server line) still restores the

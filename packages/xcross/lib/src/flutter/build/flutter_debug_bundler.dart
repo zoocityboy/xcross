@@ -10,6 +10,7 @@ import 'package:package_config/package_config.dart';
 import 'package:path/path.dart' as p;
 import 'package:standard_message_codec/standard_message_codec.dart';
 import 'package:xcross/src/flutter/build/dart_plugin_registrant.dart';
+import 'package:xcross/src/flutter/build/flutter_tool_defines.dart';
 import 'package:xcross/src/flutter/build/internal/kernel_compiler.dart';
 import 'package:xcross/src/flutter/build/internal/toolchain.dart';
 import 'package:xcross/src/flutter/build/ios_deployment_target.dart';
@@ -17,6 +18,7 @@ import 'package:xcross/src/flutter/build/ios_engine_cache.dart';
 import 'package:xcross/src/flutter/build/ios_plugins.dart';
 import 'package:xcross/src/flutter/constants.dart';
 import 'package:xcross/src/flutter/errors.dart';
+import 'package:xcross/src/flutter/models/flutter/dart_defines.dart';
 import 'package:xcross/src/flutter/models/pubspec_info.dart';
 import 'package:xcross/src/package_config_resolver.dart';
 
@@ -52,6 +54,12 @@ final class FlutterDebugBundler {
   /// `FLUTTER_APP_FLAVOR=` define (explicit define wins).
   final String? flavor;
 
+  /// `--build-name` / `--build-number` CLI values, forwarded as
+  /// `FLUTTER_BUILD_NAME` / `FLUTTER_BUILD_NUMBER` (pubspec `version:` fills
+  /// the gaps, like the flutter tool). Null when the flags were not passed.
+  final String? buildName;
+  final String? buildNumber;
+
   FlutterDebugBundler({
     required this.projectRoot,
     required this.flutterRoot,
@@ -60,6 +68,8 @@ final class FlutterDebugBundler {
     this.entrypoint = 'lib/main.dart',
     this.dartDefines = const [],
     this.flavor,
+    this.buildName,
+    this.buildNumber,
   });
 
   /// Empty zlib stream: `zlib.compress(b'')` in Python.
@@ -134,12 +144,24 @@ final class FlutterDebugBundler {
       Log.logTrace('dart plugin registrant: $registrantUri');
     }
 
+    // Tool-injected constants mirror the flutter tool: SDK identity plus the
+    // app version. They merge under explicit defines at arg-build time.
+    final toolDefines = [
+      ...await FlutterToolDefines.sdkDefines(flutterRoot: flutterRoot),
+      ...FlutterToolDefines.buildDefines(
+        buildName: buildName,
+        buildNumber: buildNumber,
+        projectRoot: projectRoot,
+      ),
+    ];
+
     final args = _frontendServerArgs(
       compiler: compiler,
       engineCache: engineCache,
       packageConfig: packageConfig,
       outputDill: outputDill,
       entrypointArg: entrypointArg,
+      toolDefines: toolDefines,
       dartPluginRegistrantUri: registrantUri,
     );
 
@@ -248,6 +270,9 @@ final class FlutterDebugBundler {
   /// The registrant [path] as the compiler and the VM must see it: a URI,
   /// never a bare filesystem path.
   ///
+  /// Shared with hot reload setup so restarted isolates reference the same
+  /// library the bundle compile did.
+  ///
   /// At runtime the engine compares `-Dflutter.dart_plugin_registrant` against
   /// the kernel library's `importUri`; a bare path matches no library, so the
   /// registrant is never run and every federated plugin stays unregistered —
@@ -255,10 +280,27 @@ final class FlutterDebugBundler {
   /// screen. The generated file sits in `.dart_tool/flutter_build/`, outside
   /// any package `lib/`, so this is the `file://` form in practice; the
   /// `package:` branch covers a project that relocates it inside a package.
-  @visibleForTesting
   static String dartPluginRegistrantUri(String path, PackageUris? packageUris) {
     final fileUri = Uri.file(path);
     return packageUris?.toPackageUri(fileUri)?.toString() ?? fileUri.toString();
+  }
+
+  /// `-D` flags for tool-injected constants (`FLUTTER_*`), merged under the
+  /// user/flavor defines so an explicitly passed key always wins.
+  @visibleForTesting
+  static List<String> toolDefineFlags({
+    required List<String> userDefines,
+    required String? flavor,
+    required List<String> toolDefines,
+  }) {
+    final base = [
+      ...userDefines,
+      if (flavor != null &&
+          !userDefines.any((d) => d.startsWith('FLUTTER_APP_FLAVOR=')))
+        'FLUTTER_APP_FLAVOR=$flavor',
+    ];
+    final merged = DartDefines.mergeFallback(base: base, fallback: toolDefines);
+    return [for (final d in merged.skip(base.length)) '-D$d'];
   }
 
   List<String> _frontendServerArgs({
@@ -267,6 +309,7 @@ final class FlutterDebugBundler {
     required String packageConfig,
     required String outputDill,
     required String entrypointArg,
+    required List<String> toolDefines,
     String? dartPluginRegistrantUri,
   }) => <String>[
     if (!compiler.isAot) '--disable-dart-dev',
@@ -277,7 +320,10 @@ final class FlutterDebugBundler {
     '-Ddart.developer.serviceExtensionStream.enabled=true',
     '-Ddart.vm.profile=false',
     '-Ddart.vm.product=false',
+    '--enable-asserts',
     '--track-widget-creation',
+    '--filesystem-scheme', 'org-dartlang-root',
+    '--verbosity=error',
     '--packages', packageConfig,
     '--output-dill', outputDill,
     // User-supplied dart-defines forwarded as -D<KEY=VALUE>.
@@ -297,6 +343,12 @@ final class FlutterDebugBundler {
       'package:flutter/src/dart_plugin_registrant.dart',
       '-Dflutter.dart_plugin_registrant=$dartPluginRegistrantUri',
     ],
+    // Tool-injected constants (FLUTTER_*), merged under explicit defines.
+    ...toolDefineFlags(
+      userDefines: dartDefines,
+      flavor: flavor,
+      toolDefines: toolDefines,
+    ),
     entrypointArg,
   ];
 

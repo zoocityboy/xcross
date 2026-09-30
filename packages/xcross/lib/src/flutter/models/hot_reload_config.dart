@@ -10,6 +10,7 @@ final class HotReloadConfig {
     required this.projectRoot,
     required this.outputDill,
     this.dartDefines = const [],
+    this.extraSources = const [],
     this.verbose = false,
   });
 
@@ -36,6 +37,10 @@ final class HotReloadConfig {
 
   /// Merged `--dart-define` values as `KEY=VALUE` strings.
   final List<String> dartDefines;
+
+  /// Extra kernel `--source` URIs (generated Dart plugin registrant), mirrored
+  /// from the bundle compile so restarted isolates boot identically.
+  final List<String> extraSources;
 
   /// Whether to emit verbose timing logs.
   final bool verbose;

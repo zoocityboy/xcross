@@ -15,7 +15,10 @@ final class FlutterBuildOptions {
   });
 
   /// Build options from raw CLI arguments, merging `--dart-define-from-file`
-  /// entries (lower precedence) with explicit `--dart-define` entries.
+  /// entries (lower precedence) with explicit `--dart-define` entries, then
+  /// appending the derived `FLUTTER_APP_FLAVOR` define unless explicitly set.
+  /// Derived here (not only in the packer) so hot reload compiles see the
+  /// identical constants as the bundled kernel.
   static Future<FlutterBuildOptions> resolve({
     required String target,
     required List<String> dartDefine,
@@ -26,9 +29,9 @@ final class FlutterBuildOptions {
     String? flavor,
   }) async => FlutterBuildOptions(
     target: target,
-    dartDefines: await DartDefines.mergeDartDefines(
-      dartDefineFromFile,
-      dartDefine,
+    dartDefines: DartDefines.withFlavorDefine(
+      await DartDefines.mergeDartDefines(dartDefineFromFile, dartDefine),
+      flavor,
     ),
     pub: pub,
     buildName: buildName,
@@ -40,7 +43,9 @@ final class FlutterBuildOptions {
   final String target;
 
   /// Merged `--dart-define` + `--dart-define-from-file` values as `KEY=VALUE`
-  /// strings (file entries first, explicit `--dart-define` overriding them).
+  /// strings (file entries first, explicit `--dart-define` overriding them),
+  /// plus the derived `FLUTTER_APP_FLAVOR` define when `--flavor` is set
+  /// (unless explicitly defined).
   final List<String> dartDefines;
 
   /// `--[no-]pub` — whether to run `flutter pub get`.

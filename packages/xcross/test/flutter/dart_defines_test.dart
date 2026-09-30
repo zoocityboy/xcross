@@ -132,4 +132,39 @@ void main() {
       },
     );
   });
+
+  group('DartDefines.keyOf', () {
+    test('splits KEY=value and bare KEY', () {
+      expect(DartDefines.keyOf('A=1'), 'A');
+      expect(DartDefines.keyOf('A='), 'A');
+      expect(DartDefines.keyOf('A'), 'A');
+      expect(DartDefines.keyOf('A=b=c'), 'A');
+    });
+  });
+
+  group('DartDefines.mergeFallback', () {
+    test('explicit base keys win over fallback', () {
+      expect(
+        DartDefines.mergeFallback(
+          base: ['A=user', 'B=2'],
+          fallback: ['A=tool', 'C=3'],
+        ),
+        ['A=user', 'B=2', 'C=3'],
+      );
+    });
+  });
+
+  group('DartDefines.withFlavorDefine', () {
+    test('appends the flavor define unless null or explicit', () {
+      expect(DartDefines.withFlavorDefine([], null), isEmpty);
+      expect(
+        DartDefines.withFlavorDefine([], 'dev'),
+        ['FLUTTER_APP_FLAVOR=dev'],
+      );
+      expect(
+        DartDefines.withFlavorDefine(['FLUTTER_APP_FLAVOR=prod'], 'dev'),
+        ['FLUTTER_APP_FLAVOR=prod'],
+      );
+    });
+  });
 }

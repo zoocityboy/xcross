@@ -67,7 +67,16 @@ final class FrontendServerSession {
       '-Ddart.developer.serviceExtensionStream.enabled=true',
       '-Ddart.vm.profile=false',
       '-Ddart.vm.product=false',
+      // Debug kernels keep asserts enabled, like the official tools' builds.
+      '--enable-asserts',
       if (options.trackWidgetCreation) '--track-widget-creation',
+      // Accepted by current SDKs (both official tools pass it); file inputs
+      // outside any package resolve the same way as in one-shot compiles.
+      '--filesystem-scheme',
+      'org-dartlang-root',
+      // The `result <boundary>` protocol lines are unaffected; only chatter
+      // that would otherwise be forwarded to the console goes away.
+      '--verbosity=error',
       for (final define in options.dartDefines) '-D$define',
       if (options.initializeFromDill case final dill?) ...[
         '--initialize-from-dill',
@@ -77,6 +86,9 @@ final class FrontendServerSession {
       options.packageConfig,
       '--output-dill',
       options.outputDill,
+      // Extra kernel sources (e.g. the generated Dart plugin registrant),
+      // mirroring one-shot bundle compiles.
+      for (final source in options.extraSources) ...['--source', source],
     ];
   }
 

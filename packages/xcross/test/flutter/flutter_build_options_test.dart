@@ -35,7 +35,11 @@ void main() {
       );
 
       expect(options.target, 'lib/other.dart');
-      expect(options.dartDefines, ['FROM_FILE=1', 'EXPLICIT=2']);
+      expect(options.dartDefines, [
+        'FROM_FILE=1',
+        'EXPLICIT=2',
+        'FLUTTER_APP_FLAVOR=dev',
+      ]);
       expect(options.pub, isFalse);
       expect(options.buildName, '2.0.0');
       expect(options.buildNumber, '42');
@@ -84,6 +88,26 @@ void main() {
       );
 
       expect(options.dartDefines, ['A=1', 'B=2']);
+    });
+
+    test('appends FLUTTER_APP_FLAVOR unless explicitly defined', () async {
+      final flavored = await FlutterBuildOptions.resolve(
+        target: 'lib/main.dart',
+        dartDefine: [],
+        dartDefineFromFile: [],
+        pub: true,
+        flavor: 'dev',
+      );
+      expect(flavored.dartDefines, ['FLUTTER_APP_FLAVOR=dev']);
+
+      final explicit = await FlutterBuildOptions.resolve(
+        target: 'lib/main.dart',
+        dartDefine: ['FLUTTER_APP_FLAVOR=prod'],
+        dartDefineFromFile: [],
+        pub: true,
+        flavor: 'dev',
+      );
+      expect(explicit.dartDefines, ['FLUTTER_APP_FLAVOR=prod']);
     });
   });
 }

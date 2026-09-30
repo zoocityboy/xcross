@@ -11,6 +11,7 @@ final class FrontendServerOptions {
     this.target = 'flutter',
     this.trackWidgetCreation = true,
     this.initializeFromDill,
+    this.extraSources = const [],
     this.onTrace,
   });
 
@@ -43,6 +44,11 @@ final class FrontendServerOptions {
 
   /// Optional warm-start dill for `--initialize-from-dill`.
   final String? initializeFromDill;
+
+  /// Extra kernel sources passed as `--source` (e.g. the generated Dart
+  /// plugin registrant plus the library that calls it), mirroring one-shot
+  /// bundle compiles so restarted isolates boot identically.
+  final List<String> extraSources;
 
   /// Optional trace logger (e.g. CLI verbose output).
   final void Function(String message)? onTrace;
