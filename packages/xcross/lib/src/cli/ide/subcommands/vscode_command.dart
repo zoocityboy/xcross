@@ -9,7 +9,8 @@ import 'package:xcross/src/cli/ide/xcross_executable.dart';
 import 'package:xcross/src/errors.dart';
 
 /// `xcross ide vscode` — write / upsert `.vscode/` so Run & Debug / Restart /
-/// Hot Reload drive `xcross flutter run`.
+/// Hot Reload drive `xcross flutter run` (or `xcross dn run` in a DartNative
+/// project — the DAP picks the subcommand from the project's pubspec).
 final class VscodeCommand extends Command<void> {
   @override
   String get name => 'vscode';

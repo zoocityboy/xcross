@@ -6,15 +6,18 @@ import 'package:cli_kit/cli_kit.dart';
 import 'package:dart_mobile_device/dart_mobile_device.dart';
 import 'package:dds/dap.dart';
 import 'package:frontend_server_kit/frontend_server_kit.dart';
+import 'package:meta/meta.dart';
 import 'package:path/path.dart' as p;
 import 'package:pure/pure.dart';
 import 'package:vm_service/vm_service.dart' as vm;
 import 'package:xcross/src/constants.dart';
+import 'package:xcross/src/dn/dn_project.dart';
 import 'package:xcross/src/package_config_resolver.dart';
 
-/// Spawns `xcross flutter run` and drives it: keypresses on its stdin for
-/// hot reload/restart/quit, plus a Dart VM Service connection (via
-/// [DartDebugAdapter]) for breakpoints/stepping/stack/variables.
+/// Spawns `xcross flutter run` (or `xcross dn run` in a DartNative project)
+/// and drives it: keypresses on its stdin for hot reload/restart/quit, plus
+/// a Dart VM Service connection (via [DartDebugAdapter]) for
+/// breakpoints/stepping/stack/variables.
 final class XcrossDap
     extends
         DartDebugAdapter<
@@ -118,11 +121,28 @@ final class XcrossDap
         : program;
     return ProcessRunner.start(
       _launcherOverride ?? Platform.resolvedExecutable,
-      ['flutter', 'run', '--target', target, ...?launchArgs.args],
+      runArguments(cwd: cwd, target: target, args: launchArgs.args),
       workingDirectory: cwd,
       environment: const {'XCROSS_DAP': '1'},
     );
   }
+
+  /// argv for the `xcross run` child: `dn run` inside a DartNative project,
+  /// `flutter run` otherwise. Both sides accept `--target` plus the
+  /// device/define flags users pass through the launch config's `args`, so
+  /// the same `.vscode/launch.json` entry drives either project kind.
+  @visibleForTesting
+  static List<String> runArguments({
+    required String cwd,
+    required String target,
+    List<String>? args,
+  }) => [
+    if (DnProject.isDartNativeProject(cwd)) 'dn' else 'flutter',
+    'run',
+    '--target',
+    target,
+    ...?args,
+  ];
 
   void _pipeChildOutput(Process child) {
     child.stdin.done.ignore();
