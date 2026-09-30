@@ -33,6 +33,7 @@ void main() {
         [
           'build',
           'bundle',
+          '-v',
           '-t',
           'lib/main.dart',
           '--target-platform',

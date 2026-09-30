@@ -162,6 +162,7 @@ final class DnRunCommand extends Command<void> {
       hotReload = await DnHotReloadSetup.buildHotReloadConfig(
         target: argResults!['target'] as String,
         dartDefines: defines.dartDefines,
+        injectedDefines: pack.injectedDefines,
         verbose: argResults!['verbose'] as bool,
       );
     }

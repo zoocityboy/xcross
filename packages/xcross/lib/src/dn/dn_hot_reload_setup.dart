@@ -2,6 +2,7 @@ import 'dart:io';
 
 import 'package:cli_kit/cli_kit.dart';
 import 'package:path/path.dart' as p;
+import 'package:xcross/src/dn/dn_injected_defines.dart';
 import 'package:xcross/src/dn/dn_project.dart';
 import 'package:xcross/src/flutter/models/hot_reload_config.dart';
 import 'package:xcross/src/package_config_resolver.dart';
@@ -21,9 +22,14 @@ abstract final class DnHotReloadSetup {
   ///
   /// Returns null (with a warning) if a required artifact is missing —
   /// callers then launch without hot reload, exactly like the Flutter path.
+  ///
+  /// [injectedDefines] are dn's own build defines (license key, `FLUTTER_*`)
+  /// scraped from the bundle build; they merge under explicit [dartDefines]
+  /// so a restarted isolate boots with the same constants as the bundle.
   static Future<HotReloadConfig?> buildHotReloadConfig({
     required String target,
     required List<String> dartDefines,
+    List<String> injectedDefines = const [],
     bool verbose = false,
   }) async {
     final projectRoot = Directory.current.path;
@@ -107,7 +113,10 @@ abstract final class DnHotReloadSetup {
       entrypoint: entrypoint,
       projectRoot: projectRoot,
       outputDill: outputDill,
-      dartDefines: dartDefines,
+      dartDefines: DnInjectedDefines.merge(
+        user: dartDefines,
+        injected: injectedDefines,
+      ),
       verbose: verbose,
     );
   }

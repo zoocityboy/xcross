@@ -6,6 +6,7 @@ import 'package:path/path.dart' as p;
 import 'package:xcross/src/dn/dn_asset_catalog.dart';
 import 'package:xcross/src/dn/dn_build_options.dart';
 import 'package:xcross/src/dn/dn_engine_cache.dart';
+import 'package:xcross/src/dn/dn_injected_defines.dart';
 import 'package:xcross/src/dn/dn_native_deps.dart';
 import 'package:xcross/src/dn/dn_project.dart';
 import 'package:xcross/src/dn/dn_runner_shim.dart';
@@ -66,11 +67,12 @@ abstract final class DnPackOperation {
       buildNumber: options.buildNumber,
     );
 
-    final assetDir = await _buildDnBundle(
+    final bundle = await _buildDnBundle(
       dn: dn,
       projectRoot: projectRoot,
       options: options,
     );
+    final assetDir = bundle.assetDir;
 
     final engineCache = DnEngineCache(dnExecutable: dn);
     await Log.logStep(
@@ -102,6 +104,7 @@ abstract final class DnPackOperation {
       outputPath: appPath,
       bundleId: bundleId,
       projectRoot: projectRoot,
+      injectedDefines: bundle.injectedDefines,
     );
   }
 
@@ -116,8 +119,16 @@ abstract final class DnPackOperation {
     }
   }
 
-  /// Run `dn build bundle --target-platform ios` and return the asset dir.
-  static Future<String> _buildDnBundle({
+  /// Run `dn build bundle --target-platform ios` and return the asset dir plus
+  /// the defines dn itself injected (license key, `FLUTTER_*`).
+  ///
+  /// The build always runs verbose with captured output: the effective
+  /// frontend_server command line is the only plaintext source of dn's
+  /// injected defines (`dn config --list` masks them). When dn skips the
+  /// kernel compile as up-to-date (no frontend_server line), the previous
+  /// run's cache fills in.
+  static Future<({String assetDir, List<String> injectedDefines})>
+  _buildDnBundle({
     required String dn,
     required String projectRoot,
     required DnBuildOptions options,
@@ -132,20 +143,46 @@ abstract final class DnPackOperation {
     if (dir.existsSync()) await dir.delete(recursive: true);
     await dir.create(recursive: true);
 
-    await ProcessRunner.runChecked(
+    final result = await ProcessRunner.run(
       dn,
       bundleArgs(options: options, assetDir: assetDir),
       workingDirectory: projectRoot,
-      inheritStdio: Log.isVerbose,
-      label: 'dn',
     );
+    if (Log.isVerbose) {
+      stdout.write(result.stdout);
+      stderr.write(result.stderr);
+    }
+    if (result.exitCode != 0) {
+      throw XcrossError(
+        'dn build bundle failed (exit ${result.exitCode}):\n'
+        '${result.stdout}\n${result.stderr}',
+      );
+    }
     if (!File(p.join(assetDir, 'kernel_blob.bin')).existsSync()) {
       throw XcrossError(
         'DnPackOperation: dn build bundle did not produce '
         '$assetDir/kernel_blob.bin',
       );
     }
-    return assetDir;
+    final injected = DnInjectedDefines.extractFromBuildLog(
+      '${result.stdout}\n${result.stderr}',
+    );
+    if (injected.isNotEmpty) {
+      // Key names only: values are secrets (dn masks them everywhere).
+      Log.logTrace(
+        'dn injected defines: '
+        '${[for (final d in injected) DnInjectedDefines.keyOf(d)]}',
+      );
+      await DnInjectedDefines.writeCache(projectRoot, injected);
+      return (assetDir: assetDir, injectedDefines: injected);
+    }
+    final cached = DnInjectedDefines.readCache(projectRoot);
+    if (cached.isNotEmpty) {
+      Log.logTrace(
+        'dn skipped the kernel compile; reusing cached injected defines',
+      );
+    }
+    return (assetDir: assetDir, injectedDefines: cached);
   });
 
   /// Effective dart-defines for `dn build bundle`, appending the flavor
@@ -158,12 +195,17 @@ abstract final class DnPackOperation {
   ];
 
   /// Argument list for `dn build bundle --target-platform ios`.
+  ///
+  /// Always verbose with captured output: the frontend_server command line
+  /// is the only plaintext source of dn's injected defines (license key,
+  /// `FLUTTER_*`), which hot reload mirrors (see [DnInjectedDefines]).
   static List<String> bundleArgs({
     required DnBuildOptions options,
     required String assetDir,
   }) => [
     'build',
     'bundle',
+    '-v',
     '-t',
     options.target,
     '--target-platform',
