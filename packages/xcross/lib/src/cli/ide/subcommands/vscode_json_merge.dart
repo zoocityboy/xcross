@@ -5,10 +5,23 @@ const String dapPathSetting = 'dart.customFlutterDapPath';
 const String dapPathValue = '.vscode/xcross_dap.dart';
 const String promptErrorsSetting = 'dart.promptToRunIfErrors';
 
+/// Shim file names (under `.vscode/`). The Flutter-adapter shim serves
+/// `dart.customFlutterDapPath`; the Dart-adapter shim serves
+/// `dart.customDartDapPath` for DartNative projects (see above).
+const String xcrossDapFile = 'xcross_dap.dart';
+const String dartDapFile = 'xcross_dart_dap.dart';
+
 /// Marks a launch config as xcross-owned. Carried in the config's `env` (a
 /// schema-valid Dart launch field) so editors don't flag an unknown key.
 const String xcrossEnvKey = 'XCROSS';
 const String xcrossEnvValue = 'true';
+
+/// `dart.customDartDapPath` shim for DartNative projects. Dart-Code classifies
+/// DN workspaces as Dart-only (their pubspecs never reference `flutter`, so
+/// `debuggerType: flutter` entries are rejected outright), therefore DN
+/// launches go through the Dart adapter slot instead of the Flutter one.
+const String dartDapPathSetting = 'dart.customDartDapPath';
+const String dartDapPathValue = '.vscode/xcross_dart_dap.dart';
 
 /// JSONC parse/merge helpers for VS Code launch.json / settings.json.
 abstract final class VscodeJsonMerge {
@@ -122,11 +135,19 @@ abstract final class VscodeJsonMerge {
       '${const JsonEncoder.withIndent('  ').convert(value)}\n';
 
   /// Canonical launch.json fields for the xcross entry (except `args`).
-  static Map<String, Object?> xcrossLaunchFields() => {
+  ///
+  /// [flutterDebugger] selects the `debuggerType` Dart-Code must use. Flutter
+  /// projects keep `"flutter"`; DartNative projects must omit the field so
+  /// Dart-Code auto-selects the Dart debugger — an explicit `"flutter"` is
+  /// rejected in DN-only workspaces ("Unable to launch Flutter project in a
+  /// Dart-only workspace") because no pubspec there references `flutter`.
+  static Map<String, Object?> xcrossLaunchFields({
+    bool flutterDebugger = true,
+  }) => {
     'name': xcrossLaunchName,
     'type': 'dart',
     'request': 'launch',
-    'debuggerType': 'flutter',
+    if (flutterDebugger) 'debuggerType': 'flutter',
     'program': 'lib/main.dart',
     'cwd': r'${workspaceFolder}',
   };
@@ -146,18 +167,27 @@ abstract final class VscodeJsonMerge {
   /// keeping the user's own keys, their original order, their `env` and their
   /// `args` (device flags they typed there must survive a re-run).
   /// The legacy top-level `xcross` flag is migrated into `env`.
+  /// With [flutterDebugger] false (DartNative projects) a stale
+  /// `debuggerType: flutter` is removed so Dart-Code stops rejecting the
+  /// entry in DN-only workspaces.
   static Map<String, Object?> _withCanonicalFields(
     Map<Object?, Object?> entry,
-    Map<String, String> generatedEnvironment,
-  ) {
+    Map<String, String> generatedEnvironment, {
+    bool flutterDebugger = true,
+  }) {
     final merged = <String, Object?>{
       for (final e in entry.entries) '${e.key}': e.value,
     };
+    if (!flutterDebugger) {
+      // A stale explicit `flutter` type would keep Dart-Code rejecting the
+      // entry in DN-only workspaces; auto-detect (Dart) is what we merge.
+      merged.remove('debuggerType');
+    }
     final args = merged.containsKey('args') ? merged['args'] : <Object?>[];
     final env = _withMarker(merged['env'], generatedEnvironment);
     return merged
       ..remove('xcross')
-      ..addAll(xcrossLaunchFields())
+      ..addAll(xcrossLaunchFields(flutterDebugger: flutterDebugger))
       ..['env'] = env
       ..['args'] = args;
   }
@@ -170,9 +200,13 @@ abstract final class VscodeJsonMerge {
               (config['env']! as Map)[xcrossEnvKey] == xcrossEnvValue));
 
   /// Upsert the xcross launch configuration into a launch.json document.
+  /// With [flutterDebugger] false (DartNative projects) the entry carries no
+  /// `debuggerType` so Dart-Code uses its Dart debugger instead of rejecting
+  /// an explicit `"flutter"` in a workspace without Flutter projects.
   static Map<String, Object?> mergeLaunchDoc(
     Map<String, Object?>? existing, {
     Map<String, String> generatedEnvironment = const {},
+    bool flutterDebugger = true,
   }) {
     final doc = <String, Object?>{...?existing};
     doc.putIfAbsent('version', () => '0.2.0');
@@ -181,7 +215,7 @@ abstract final class VscodeJsonMerge {
     final index = configs.indexWhere(_isXcrossConfig);
     if (index < 0) {
       configs.add({
-        ...xcrossLaunchFields(),
+        ...xcrossLaunchFields(flutterDebugger: flutterDebugger),
         'env': _withMarker(null, generatedEnvironment),
         'args': <Object?>[],
       });
@@ -189,6 +223,7 @@ abstract final class VscodeJsonMerge {
       configs[index] = _withCanonicalFields(
         configs[index]! as Map,
         generatedEnvironment,
+        flutterDebugger: flutterDebugger,
       );
     }
 
@@ -197,7 +232,17 @@ abstract final class VscodeJsonMerge {
   }
 
   /// Upsert xcross DAP settings onto a settings.json document.
+  /// [dartDapPath] adds the Dart-adapter shim for DartNative projects (their
+  /// launches go through the Dart adapter slot); Flutter projects only need
+  /// the Flutter-adapter shim.
   static Map<String, Object?> mergeSettingsDoc(
-    Map<String, Object?>? existing,
-  ) => {...?existing, dapPathSetting: dapPathValue, promptErrorsSetting: false};
+    Map<String, Object?>? existing, {
+    String? dartDapPath,
+  }) {
+    final doc = <String, Object?>{...?existing};
+    doc[dapPathSetting] = dapPathValue;
+    doc[promptErrorsSetting] = false;
+    if (dartDapPath != null) doc[dartDapPathSetting] = dartDapPath;
+    return doc;
+  }
 }

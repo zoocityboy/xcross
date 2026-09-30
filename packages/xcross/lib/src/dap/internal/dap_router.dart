@@ -163,7 +163,11 @@ final class DapRouter {
 
     if (useXcross) {
       _startXcrossAdapter(inbound.stream, filtered);
-    } else if (!await _startFlutterAdapter(inbound.stream, filtered)) {
+    } else if (!await _startFallbackAdapter(
+      inbound.stream,
+      filtered,
+      launchRequest['arguments'],
+    )) {
       return;
     }
 
@@ -182,6 +186,41 @@ final class DapRouter {
       return '${env['XCROSS']}'.toLowerCase() == 'true';
     }
     return false;
+  }
+
+  /// Sessions the `.vscode/xcross_dart_dap.dart` shim delivered arrived
+  /// through the Dart adapter slot (DartNative workspace); their fallback is
+  /// the Dart SDK's adapter. Everything else keeps the Flutter fallback.
+  /// The shim marks itself with an explicit environment entry on its own
+  /// spawn, so the marker survives declarative mode (no parent environment).
+  static bool get _dartShimmed =>
+      Platform.environment['XCROSS_DART_SHIM'] == 'true';
+
+  Future<bool> _startFallbackAdapter(
+    Stream<List<int>> inbound,
+    DapResponseFilter outbound,
+    Object? launchArgs,
+  ) =>
+      _dartShimmed
+          ? _startDartAdapter(inbound, outbound, launchArgs)
+          : _startFlutterAdapter(inbound, outbound);
+
+  /// Resolve the `dart` executable owning the session's own SDK
+  /// (`dartSdkPath` in the DAP launch request — the SDK Dart-Code itself
+  /// selected), or null when it is missing or has no `bin/dart`.
+  static String? resolveDartExecutable(Object? launchArgs) {
+    if (launchArgs is Map<Object?, Object?>) {
+      final sdkPath = launchArgs['dartSdkPath'];
+      if (sdkPath is String && sdkPath.isNotEmpty) {
+        final candidate = p.join(
+          sdkPath,
+          'bin',
+          Platform.isWindows ? 'dart.exe' : 'dart',
+        );
+        if (File(candidate).existsSync()) return candidate;
+      }
+    }
+    return null;
   }
 
   void _startXcrossAdapter(
@@ -209,6 +248,41 @@ final class DapRouter {
       return false;
     }
     final child = await ProcessRunner.start(flutter, const ['debug-adapter']);
+    _pipeAdapterChild(child, inbound, outbound);
+    return true;
+  }
+
+  /// Fallback for sessions the `.vscode/xcross_dart_dap.dart` shim delivered:
+  /// this DAP arrived through the Dart adapter slot (DartNative workspace),
+  /// so unmarked sessions go to the Dart SDK's own adapter instead of
+  /// Flutter's. The SDK is the one Dart-Code itself selected
+  /// (`dartSdkPath` in the launch request), keeping plain `dart run` /
+  /// CodeLens sessions bit-for-bit identical to life without xcross.
+  Future<bool> _startDartAdapter(
+    Stream<List<int>> inbound,
+    DapResponseFilter outbound,
+    Object? launchArgs,
+  ) async {
+    final dart = resolveDartExecutable(launchArgs);
+    if (dart == null) {
+      stderr.writeln(
+        'xcross dap: launch config is missing "env": {"XCROSS": "true"} '
+        'and no Dart SDK path arrived with the launch request — cannot fall '
+        'back to the Dart DAP.',
+      );
+      await outbound.close();
+      return false;
+    }
+    final child = await ProcessRunner.start(dart, const ['debug_adapter']);
+    _pipeAdapterChild(child, inbound, outbound);
+    return true;
+  }
+
+  void _pipeAdapterChild(
+    Process child,
+    Stream<List<int>> inbound,
+    DapResponseFilter outbound,
+  ) {
     child.stderr.listen(stderr.add, onError: (_) {});
     inbound.listen(
       child.stdin.add,
@@ -218,7 +292,6 @@ final class DapRouter {
     );
     child.stdout.listen(outbound.add, onError: (_) {}, onDone: outbound.close);
     unawaited(child.exitCode.then((_) => _closeRest()));
-    return true;
   }
 
   void _ack(String command, int requestSeq, Map<String, Object?> request) {

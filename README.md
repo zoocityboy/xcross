@@ -419,6 +419,7 @@ Writes the DAP shim and upserts an xcross launch entry + DAP settings into `.vsc
 
 - Works in VS Code forks with the Dart-Code extension installed.
 - The xcross launch config sets `"env": { "XCROSS": "true" }`; other Flutter launch configs in the workspace keep working - sessions without that marker are handed to Flutter's own debug adapter.
+- In DartNative projects the entry omits `debuggerType` and a second shim serves `dart.customDartDapPath`: Dart-Code classifies DN workspaces as Dart-only (their pubspecs never reference `flutter`), so an explicit `"flutter"` type is rejected outright. F5 drives `xcross dn run`; plain `dart run` / `dart test` / CodeLens sessions are handed to the Dart SDK's own adapter unchanged.
 - For multiple iPhones, set `"args": ["--udid", "<UDID>"]` on the xcross entry; re-running the command preserves those args.
 - Existing `launch.json` / `settings.json` are merged in place (xcross keys upserted, everything else kept). A second run is a no-op when already current.
 - Run the *installed* `xcross`; the generated DAP shim records that binary's path.

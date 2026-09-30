@@ -26,6 +26,35 @@ void main() {
     );
   });
 
+  group('DapRouter.resolveDartExecutable', () {
+    test('resolves bin/dart under the session SDK path', () {
+      final sdk = Directory.systemTemp.createTempSync('xcross-dart-sdk-');
+      try {
+        final bin = Directory(p.join(sdk.path, 'bin'))..createSync();
+        final dart = File(
+          p.join(bin.path, Platform.isWindows ? 'dart.exe' : 'dart'),
+        )..writeAsStringSync('#!/bin/sh\n');
+        expect(
+          DapRouter.resolveDartExecutable({'dartSdkPath': sdk.path}),
+          dart.path,
+        );
+      } finally {
+        sdk.deleteSync(recursive: true);
+      }
+    });
+
+    test('returns null without a usable SDK path', () {
+      expect(DapRouter.resolveDartExecutable(null), isNull);
+      expect(DapRouter.resolveDartExecutable({}), isNull);
+      expect(
+        DapRouter.resolveDartExecutable({
+          'dartSdkPath': p.join('no', 'such', 'sdk'),
+        }),
+        isNull,
+      );
+    });
+  });
+
   test('DapFrameParser splits Content-Length frames across chunks', () {
     final parser = DapFrameParser();
     final msg = DapFrame.encode({
