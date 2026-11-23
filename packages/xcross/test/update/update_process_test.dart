@@ -2,28 +2,33 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
-import 'package:cli_kit/cli_kit.dart';
+import 'package:cli_kit/host/linux/linux_host.dart';
+import 'package:meta/meta.dart';
 import 'package:path/path.dart' as p;
 import 'package:test/test.dart';
-import 'package:xcross/src/errors.dart';
-import 'package:xcross/src/update/internal/update_process.dart';
+import 'package:xcross/src/shared/errors/errors.dart';
+import 'package:xcross/src/shared/update/internal/update_process.dart';
+
+import '../host_operations_fixtures.dart';
 
 Future<List<String>> _captureAsync(Future<void> Function() body) async {
-  final sink = _LineCaptureStdout();
+  final sink = FixtureLineCaptureStdout();
   await IOOverrides.runZoned(
     () => runZoned(
       body,
       zoneSpecification: ZoneSpecification(
-        print: (_, __, ___, line) => sink.writeln(line),
+        print: (_, _, _, line) => sink.writeln(line),
       ),
     ),
     stdout: () => sink,
     stderr: () => sink,
   );
+  await sink.close();
   return sink.lines;
 }
 
-final class _LineCaptureStdout implements Stdout {
+@internal
+final class FixtureLineCaptureStdout implements Stdout {
   final _lines = <String>[];
   final _buffer = StringBuffer();
 
@@ -106,7 +111,11 @@ void main() {
       const executable = 'xcross-guaranteed-missing-update-executable';
 
       await expectLater(
-        () => runUpdateProcess(executable, const []),
+        () => runUpdateProcess(
+          fixtureRunner(LinuxHost(), log: fixtureLog()),
+          executable,
+          const [],
+        ),
         throwsA(
           isA<XcrossError>()
               .having((error) => error.message, 'message', contains(executable))
@@ -118,6 +127,8 @@ void main() {
 
   for (final extension in ['bat', 'cmd']) {
     test(
+      testOn: '!windows',
+
       'preserves encoded ref arguments through Windows .$extension',
       () async {
         final temp = await Directory.systemTemp.createTemp(
@@ -131,6 +142,7 @@ void main() {
 
         const encodedBranch = 'feature%2Fa%2Cb%3Dc';
         final result = await runUpdateProcess(
+          fixtureRunner(LinuxHost(), log: fixtureLog()),
           script.path,
           [encodedBranch],
           environment: {'2Fa': 'EXPANDED'},
@@ -144,6 +156,8 @@ void main() {
   }
 
   test(
+    testOn: '!windows',
+
     'preserves the built version through a Windows Dart batch launcher',
     () async {
       final temp = await Directory.systemTemp.createTemp(
@@ -162,6 +176,7 @@ void main() {
         );
 
       final result = await runUpdateProcess(
+        fixtureRunner(LinuxHost(), log: fixtureLog()),
         dartBatch.path,
         ['run', '-DXCROSS_VERSION=feature%2Fa%2Cb%3Dc', script.path],
         environment: {'2Fa': 'EXPANDED'},
@@ -174,6 +189,8 @@ void main() {
   );
 
   test(
+    testOn: '!windows',
+
     'streams stdout and stderr into the active step while preserving capture',
     () async {
       final temp = await Directory.systemTemp.createTemp(
@@ -193,13 +210,15 @@ void main() {
           '}\n',
         );
 
-      Log.setVerbose();
+      final log = fixtureLog();
+      log.setVerbose();
       final loggedLines = await _captureAsync(() async {
-        final step = Log.beginStep('Streaming process');
-        final result = await runUpdateProcess(Platform.resolvedExecutable, [
-          'run',
-          script.path,
-        ]);
+        final step = log.beginStep('Streaming process');
+        final result = await runUpdateProcess(
+          fixtureRunner(LinuxHost(), log: log),
+          Platform.resolvedExecutable,
+          ['run', script.path],
+        );
         expect(result.stdout, contains('stdout-line'));
         expect(result.stderr, contains('stderr-line'));
         step.done();

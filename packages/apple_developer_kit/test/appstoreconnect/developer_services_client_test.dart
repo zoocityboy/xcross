@@ -1,15 +1,53 @@
 import 'dart:convert';
 
-import 'package:apple_developer_kit/src/appstoreconnect/developer_services_client.dart';
-import 'package:apple_developer_kit/src/errors.dart';
-import 'package:apple_developer_kit/src/grandslam/app_token_exchange.dart';
+import 'package:apple_developer_kit/shared/appstoreconnect/developer_services_client.dart';
+import 'package:apple_developer_kit/shared/appstoreconnect/developer_services_team_discovery_client.dart';
+import 'package:apple_developer_kit/shared/errors/errors.dart';
+import 'package:apple_developer_kit/shared/grandslam/app_token_exchange.dart';
 import 'package:http/http.dart' as http;
 import 'package:http/testing.dart';
+import 'package:meta/meta.dart';
 import 'package:propertylistserialization/propertylistserialization.dart';
 import 'package:test/test.dart';
 
 void main() {
   group('DeveloperServicesClient', () {
+    test(
+      'finds exact certificate serial without unsupported server filter',
+      () async {
+        final client = DeveloperServicesClient(
+          token: _token(),
+          teamId: 'TEAM',
+          fetchAnisetteHeaders: () async => {},
+          httpClient: MockClient((request) async {
+            expect(request.headers['X-HTTP-Method-Override'], 'GET');
+            expect(
+              (jsonDecode(request.body) as Map)['urlEncodedQueryParams'],
+              'teamId=TEAM',
+            );
+            return http.Response(
+              jsonEncode({
+                'data': [
+                  {
+                    'id': 'unrelated',
+                    'attributes': {'serialNumber': 'OTHER'},
+                  },
+                  {
+                    'id': 'expected',
+                    'attributes': {'serialNumber': 'TARGET'},
+                  },
+                ],
+              }),
+              200,
+            );
+          }),
+        );
+        addTearDown(client.close);
+        expect(await client.findCertificateIdsBySerial('TARGET'), ['expected']);
+        expect(await client.findCertificateIdsBySerial('MISSING'), isEmpty);
+      },
+    );
+
     test('reports HTML 429 without JSON decoding or retrying', () async {
       var requests = 0;
       final client = DeveloperServicesClient(
@@ -20,7 +58,7 @@ void main() {
           requests++;
           expect(
             request.headers['X-MMe-Client-Info'],
-            contains('com.apple.akd/1.0'),
+            contains('com.apple.android.music/4.9.6'),
           );
           return http.Response(
             '<html>Too Many Requests</html>',
@@ -510,7 +548,160 @@ void main() {
     });
   });
 
-  group('DeveloperServicesClient.listTeams', () {
+  group('DeveloperServicesTeamDiscoveryClient.listTeams', () {
+    test(
+      'construction and expiry rejection leave dependencies untouched',
+      () async {
+        var anisetteCalls = 0;
+        var requests = 0;
+        final httpClient = TrackingTeamHttpClient((_) async {
+          requests++;
+          return http.Response('', 200);
+        });
+        addTearDown(httpClient.close);
+        final discovery = DeveloperServicesTeamDiscoveryClient(
+          httpClient: httpClient,
+          fetchAnisetteHeaders: () async {
+            anisetteCalls++;
+            return {};
+          },
+        );
+        expect(anisetteCalls, 0);
+        expect(requests, 0);
+        expect(httpClient.closeCalls, 0);
+        await expectLater(
+          discovery.listTeams(
+            token: _token(expired: true),
+            localeName: 'en_US',
+          ),
+          throwsA(
+            isA<AppleError>().having(
+              (error) => error.message,
+              'message',
+              'Developer Services session has expired. Run xcross auth again.',
+            ),
+          ),
+        );
+        expect(anisetteCalls, 0);
+        expect(requests, 0);
+        expect(httpClient.closeCalls, 0);
+      },
+    );
+
+    for (final status in [200, 403, 429]) {
+      test('caller owns HTTP lifecycle after status $status', () async {
+        final httpClient = TrackingTeamHttpClient(
+          (_) async => http.Response(
+            PropertyListSerialization.stringWithPropertyList({
+              'resultCode': 0,
+              'teams': <Object?>[],
+            }),
+            status,
+          ),
+        );
+        addTearDown(httpClient.close);
+        final discovery = DeveloperServicesTeamDiscoveryClient(
+          httpClient: httpClient,
+          fetchAnisetteHeaders: () async => {},
+        );
+        for (var attempt = 0; attempt < 2; attempt++) {
+          final result = discovery.listTeams(
+            token: _token(),
+            localeName: 'en_US',
+          );
+          if (status == 200) {
+            expect(await result, isEmpty);
+          } else {
+            await expectLater(result, throwsA(isA<AppleError>()));
+          }
+          expect(httpClient.closeCalls, 0);
+        }
+        expect(
+          (await httpClient.get(
+            Uri.parse('https://fixture.invalid/'),
+          )).statusCode,
+          status,
+        );
+        expect(httpClient.closeCalls, 0);
+      });
+    }
+
+    for (final failAnisette in [false, true]) {
+      test(
+        'preserves ${failAnisette ? 'anisette' : 'HTTP'} failure identity and ownership',
+        () async {
+          final failure = Exception('fixture failure');
+          final stack = StackTrace.fromString('team-discovery-fixture-stack');
+          var requests = 0;
+          final httpClient = TrackingTeamHttpClient((_) {
+            requests++;
+            return Future<http.Response>.error(failure, stack);
+          });
+          addTearDown(httpClient.close);
+          final discovery = DeveloperServicesTeamDiscoveryClient(
+            httpClient: httpClient,
+            fetchAnisetteHeaders: () async {
+              if (failAnisette) Error.throwWithStackTrace(failure, stack);
+              return {};
+            },
+          );
+          try {
+            await discovery.listTeams(token: _token(), localeName: 'en_US');
+            fail('expected fixture failure');
+          } on Exception catch (error, actualStack) {
+            expect(error, same(failure));
+            expect(actualStack.toString(), contains(stack.toString()));
+          }
+          expect(requests, failAnisette ? 0 : 1);
+          expect(httpClient.closeCalls, 0);
+        },
+      );
+    }
+
+    for (final invalid in <Map<String, Object?>>[
+      {'resultCode': 0},
+      {'resultCode': 0, 'teams': 'invalid'},
+      {
+        'resultCode': 0,
+        'teams': [
+          {'teamId': '', 'name': 'Team', 'status': 'active'},
+        ],
+      },
+      {
+        'resultCode': 0,
+        'teams': [
+          {'teamId': 'T', 'name': 7, 'status': 'active'},
+        ],
+      },
+      {
+        'resultCode': 0,
+        'teams': [
+          {'teamId': 'T', 'name': 'Team'},
+        ],
+      },
+    ]) {
+      test(
+        'rejects malformed team data $invalid without closing HTTP',
+        () async {
+          final httpClient = TrackingTeamHttpClient(
+            (_) async => http.Response(
+              PropertyListSerialization.stringWithPropertyList(invalid),
+              200,
+            ),
+          );
+          addTearDown(httpClient.close);
+          await expectLater(
+            DeveloperServicesTeamDiscoveryClient(
+              httpClient: httpClient,
+              fetchAnisetteHeaders: () async => {},
+            ).listTeams(token: _token(), localeName: 'en_US'),
+            throwsA(isA<AppleError>()),
+          );
+          expect(httpClient.closeCalls, 0);
+        },
+      );
+    }
+
     test('preserves throttling guidance at the last auth step', () async {
       var requests = 0;
       final client = MockClient((request) async {
@@ -523,11 +714,10 @@ void main() {
       });
       addTearDown(client.close);
       await expectLater(
-        DeveloperServicesClient.listTeams(
-          token: _token(),
+        DeveloperServicesTeamDiscoveryClient(
           fetchAnisetteHeaders: () async => {},
           httpClient: client,
-        ),
+        ).listTeams(token: _token(), localeName: 'en_US'),
         throwsA(
           isA<AppleRateLimitError>()
               .having(
@@ -547,8 +737,7 @@ void main() {
 
     test('sends legacy plist request and parses teams', () async {
       var anisetteCalls = 0;
-      final teams = await DeveloperServicesClient.listTeams(
-        token: _token(),
+      final teams = await DeveloperServicesTeamDiscoveryClient(
         fetchAnisetteHeaders: () async {
           anisetteCalls++;
           return {'X-Apple-I-MD': 'fresh'};
@@ -574,7 +763,13 @@ void main() {
           expect(body['clientId'], 'XABBG36SBA');
           expect(body['protocolVersion'], 'QH65B2');
           expect(body['requestId'], isA<String>());
-          expect(body['userLocale'], isA<List<Object?>>());
+          expect(body['userLocale'], ['en_US']);
+          expect(request.headers['Accept'], 'text/x-xml-plist');
+          expect(request.headers['User-Agent'], 'Xcode');
+          expect(
+            request.headers['X-Apple-App-Info'],
+            'com.apple.gs.xcode.auth',
+          );
           return http.Response(
             PropertyListSerialization.stringWithPropertyList({
               'resultCode': '0',
@@ -585,7 +780,7 @@ void main() {
             200,
           );
         }),
-      );
+      ).listTeams(token: _token(), localeName: 'en_US');
 
       expect(anisetteCalls, 1);
       expect(teams, hasLength(1));
@@ -596,8 +791,7 @@ void main() {
 
     test('throws userString for nonzero legacy resultCode', () async {
       await expectLater(
-        DeveloperServicesClient.listTeams(
-          token: _token(),
+        DeveloperServicesTeamDiscoveryClient(
           fetchAnisetteHeaders: () async => {},
           httpClient: MockClient(
             (_) async => http.Response(
@@ -608,7 +802,7 @@ void main() {
               200,
             ),
           ),
-        ),
+        ).listTeams(token: _token(), localeName: 'en_US'),
         throwsA(
           isA<AppleError>().having(
             (error) => error.toString(),
@@ -632,3 +826,16 @@ DeveloperServicesLoginToken _token({bool expired = false}) =>
       token: 'token',
       expiry: DateTime.now().toUtc().add(Duration(days: expired ? -1 : 1)),
     );
+
+@internal
+final class TrackingTeamHttpClient extends MockClient {
+  TrackingTeamHttpClient(super.fn);
+
+  int closeCalls = 0;
+
+  @override
+  void close() {
+    closeCalls++;
+    super.close();
+  }
+}

@@ -1,10 +1,19 @@
+@TestOn('!windows')
+library;
+
 import 'dart:io';
 
 import 'package:path/path.dart' as p;
 import 'package:test/test.dart';
-import 'package:xcross/src/compose/watch/kotlin_source_watcher.dart';
+
+import 'support/compose_platforms.dart';
 
 void main() {
+  late ComposeTestSession session;
+  setUp(() {
+    session = createComposeTestSession();
+  });
+  tearDown(() => session.dispose());
   late Directory root;
 
   setUp(() => root = Directory.systemTemp.createTempSync('xcross_kt_watch'));
@@ -23,14 +32,63 @@ void main() {
     write('gradle/libs.versions.toml', '[versions]');
     write('README.md', 'not a source');
 
-    final names = KotlinSourceWatcher(
-      root.path,
-    ).sourceFiles().map(p.basename).toSet();
+    final names = session
+        .fixtureSourceWatcher(root.path)
+        .sourceFiles()
+        .map(p.basename)
+        .toSet();
 
     expect(names, contains('App.kt'));
     expect(names, contains('build.gradle.kts'));
     expect(names, contains('libs.versions.toml'));
     expect(names, isNot(contains('README.md')));
+  });
+
+  test('collects Swift host sources so new imports trigger a rebuild', () {
+    write('iosApp/iosApp/ContentView.swift', 'import SwiftUI');
+    final names = session
+        .fixtureSourceWatcher(root.path)
+        .sourceFiles()
+        .map(p.basename);
+    expect(names, contains('ContentView.swift'));
+  });
+
+  test('ignores Swift files discovery never compiles', () {
+    // A `pod install`, an edited test target or an Xcode preview cannot
+    // change the app xcross builds, so they must not cost a rebuild.
+    write('iosApp/iosApp/ContentView.swift', 'import SwiftUI');
+    write('iosApp/Pods/Alamofire/Source/AF.swift', 'import Foundation');
+    write('iosApp/Carthage/Build/Lib.swift', 'import Foundation');
+    write('iosApp/iosAppTests/AppTests.swift', 'import XCTest');
+    write('iosApp/iosAppUITests/UITests.swift', 'import XCTest');
+    write('iosApp/iosApp/Preview Content/Preview.swift', 'import SwiftUI');
+    write('shared/src/iosMain/Stray.swift', 'import Foundation');
+
+    final names = session
+        .fixtureSourceWatcher(root.path)
+        .sourceFiles()
+        .where((path) => path.endsWith('.swift'))
+        .map(p.basename)
+        .toList();
+
+    expect(names, ['ContentView.swift']);
+  });
+
+  test('watches the Swift package declarations of the Xcode project', () {
+    write('iosApp/iosApp.xcodeproj/project.pbxproj', '{}');
+    write(
+      'iosApp/iosApp.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/'
+          'Package.resolved',
+      '{}',
+    );
+    write('iosApp/iosApp.xcodeproj/xcuserdata/me.xcuserdatad/x.plist', '');
+
+    final names = session
+        .fixtureSourceWatcher(root.path)
+        .sourceFiles()
+        .map(p.basename)
+        .toSet();
+    expect(names, {'project.pbxproj', 'Package.resolved'});
   });
 
   test('ignores build output directories', () {
@@ -41,7 +99,7 @@ void main() {
     write('shared/build/tmp/Other.kt', 'generated');
     write('.gradle/cache.properties', 'x=1');
 
-    final files = KotlinSourceWatcher(root.path).sourceFiles();
+    final files = session.fixtureSourceWatcher(root.path).sourceFiles();
 
     expect(files, hasLength(1));
     expect(p.basename(files.single), 'App.kt');
@@ -49,7 +107,7 @@ void main() {
 
   test('detects edits, additions, and deletions', () {
     final app = write('shared/src/App.kt', 'fun main() {}');
-    final watcher = KotlinSourceWatcher(root.path)..snapshot();
+    final watcher = session.fixtureSourceWatcher(root.path)..snapshot();
 
     expect(watcher.changedFiles(), isEmpty);
 
@@ -67,7 +125,7 @@ void main() {
 
   test('rewriting identical content is not a change', () {
     final app = write('shared/src/App.kt', 'fun main() {}');
-    final watcher = KotlinSourceWatcher(root.path)..snapshot();
+    final watcher = session.fixtureSourceWatcher(root.path)..snapshot();
 
     // Editors and formatters rewrite files wholesale, which bumps mtime
     // without changing content; a rebuild here costs ~2 minutes.
@@ -78,7 +136,7 @@ void main() {
 
   test('invalidate forces the next check to report a change again', () {
     final app = write('shared/src/App.kt', 'fun main() {}');
-    final watcher = KotlinSourceWatcher(root.path)..snapshot();
+    final watcher = session.fixtureSourceWatcher(root.path)..snapshot();
     app.writeAsStringSync('broken');
     final changed = watcher.changedFiles();
     expect(changed, isNotEmpty);
@@ -92,7 +150,7 @@ void main() {
 
   test('hasChanges reports the same signal as changedFiles', () {
     final app = write('shared/src/App.kt', 'fun main() {}');
-    final watcher = KotlinSourceWatcher(root.path)..snapshot();
+    final watcher = session.fixtureSourceWatcher(root.path)..snapshot();
 
     expect(watcher.hasChanges(), isFalse);
     app.writeAsStringSync('fun main() { }');
@@ -101,7 +159,8 @@ void main() {
   });
 
   test('a missing project root yields no sources instead of throwing', () {
-    final watcher = KotlinSourceWatcher(p.join(root.path, 'nope'))..snapshot();
+    final watcher = session.fixtureSourceWatcher(p.join(root.path, 'nope'))
+      ..snapshot();
     expect(watcher.sourceFiles(), isEmpty);
     expect(watcher.changedFiles(), isEmpty);
   });

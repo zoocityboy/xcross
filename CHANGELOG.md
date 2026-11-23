@@ -1,3 +1,92 @@
+## 2.1.3
+
+- Flutter iOS builds no longer fail with "call to main actor-isolated static method 'register(with:)' in a synchronous nonisolated context" when a plugin's `register(with:)` is `@MainActor`. The generated plugin registrant is now isolated to the main actor. ([#171](https://github.com/arxdeus/xcross/pull/171))
+- `xcross update` refuses to install a damaged release archive instead of extracting partial files, and Xcode SDK payloads and Swift packages decode correctly with `archive` 4.7. ([#175](https://github.com/arxdeus/xcross/pull/175))
+- Flutter apps launched from the debug adapter get `PWD` set to the launch `cwd`, so SwiftPM manifests that read `PWD` to find the host app (such as `permission_handler_apple`) resolve against the project instead of a stale directory. ([#176](https://github.com/arxdeus/xcross/pull/176))
+
+## 2.1.2
+
+- Linux and macOS release binaries ship a working `xcrun` again. Dart 3.14's `dart build cli` puts each executable's code in `lib/libdartaot<name>`, and the release copied only `bin/xcrun`, so it ran as a bare Dart runtime and Flutter native-asset builds failed with "Failed to find clang with xcrun". ([#165](https://github.com/arxdeus/xcross/issues/165))
+- `xcross flutter run` on an iOS device shows the app's logs and starts hot reload again with Flutter 3.50. Dart 3.14's VM Service rejects requests whose `Host` is not loopback or its own bind address, so connecting through the device tunnel (`[fdxx::1]`) failed with "was not upgraded to websocket". Debug and profile launches now pass `--disable-service-origin-check`. If hot reload still cannot start, the app's `print` output is shown from the device log instead of going silent. ([#167](https://github.com/arxdeus/xcross/issues/167))
+- `xcross flutter build` and `run` with `--flavor` use the Xcode build configuration of the selected flavor (such as `Debug-dev`), so its bundle identifier, build settings and resources apply instead of the default configuration's. ([#169](https://github.com/arxdeus/xcross/pull/169))
+- The debug adapter launches Flutter apps in profile and release mode, not only debug, and forwards the launch configuration's environment to the child process. ([#170](https://github.com/arxdeus/xcross/pull/170))
+
+## 2.1.1
+
+- Flutter 3.50 builds with native assets compile again. Flutter 3.50 records code asset paths as `@rpath/...` install names, which xcross could not resolve to the built frameworks. ([#160](https://github.com/arxdeus/xcross/issues/160), [#161](https://github.com/arxdeus/xcross/pull/161))
+
+## 2.1.0
+
+- `xcross compose build` builds the Swift packages a SwiftUI host's app target declares in `iosApp/*.xcodeproj` and links and embeds them. Remote and local packages, C targets, resource bundles and binary targets go through the SwiftPM engine Flutter plugins build with, honoring Xcode's `Package.resolved`, into one `XcrossHostPackages.framework`. Resource bundles land in the app root and binary frameworks in `Frameworks/`. Packages used only by test or extension targets are skipped, and the app follows the app target's `IPHONEOS_DEPLOYMENT_TARGET` when it is above 15.0. Swift imports are checked twice before the Kotlin compile: against the SDK and the declared packages before anything is downloaded (only when every package's modules are known then, so a module a remote package brings in transitively, such as `FirebaseCore` from product `FirebaseAnalytics`, is never rejected early), and against the modules the packages actually built. `xcross compose doctor` counts imports resolved by packages, and `xcross compose run --watch` rebuilds when `project.pbxproj` or `Package.resolved` changes. Projects without packages build as before. CocoaPods are still not supported.
+- The SwiftPM engine (package build, product assembly, and embedding of dynamic products, binary frameworks, static framework stubs and resource bundles) is shared by Flutter and Compose. Flutter output is unchanged.
+- Apps whose Swift packages link a Swift runtime back-deployment library through `@rpath` now embed it in `Frameworks/` as Xcode does, from the Darwin SDK. Before, a package using `Span` (swift-collections 1.2 and later, `OrderedSet`) built for iOS below 26 shipped without `libswiftCompatibilitySpan.dylib`. `xcross sdk install` now keeps the iOS device and simulator back-deployment libraries of Xcode's toolchain (`usr/lib/swift-6.2` and `swift-5.5`, about 3 MB). With an SDK installed earlier the build warns and asks to re-run `xcross sdk install` once. Compose simulator builds also sign these loose dylibs.
+- Compose Multiplatform SwiftUI hosts can import any module the Darwin SDK provides. xcross no longer checks a SwiftUI `@main` app's imports against a fixed list of frameworks (`SwiftUI`, `UIKit`, `Foundation`, ...), which silently built such apps as framework-only when they imported anything else, such as `CoreMotion`, `AVFoundation` or `MapKit`. Imports are resolved against the installed Darwin SDK and the KMP framework instead. Imports parse with attributes (`@testable`, `@preconcurrency`), access modifiers (`public import`), declaration imports (`import struct CoreImage.CIColor`) and submodules, and ignore comments and strings. Imports inside `#if canImport(...)` blocks are optional. An import the SDK cannot resolve, such as a CocoaPods or SwiftPM dependency, fails the build before the Kotlin compile with each module's `file:line`, and `xcross compose doctor` reports it under `Swift imports`. Implementation-detail modules such as `SwiftUICore` are rejected with a hint to import their public module (`SwiftUI`) instead, as swiftc requires. Choosing between several KMP framework modules now needs an exact `import <Framework>`, so `import SharedUI` no longer selects `Shared`. `xcross compose run --watch` also rebuilds when the SwiftUI host's `.swift` files change, not only Kotlin and Gradle sources. ([#155](https://github.com/arxdeus/xcross/pull/155))
+- Flutter IPAs built on Windows and Linux now carry the app icon, launch screen, asset catalog and entitlements the way Xcode builds them. A pure-Dart `actool` compiles the app's image, color and app icon sets (including dark, tinted and alternate icons) into an LZFSE-compressed `Assets.car` and writes the same loose icons, `CFBundleIcons` and `NSAccentColorName` keys. A pure-Dart `ibtool` compiles simple launch storyboards into `Base.lproj/LaunchScreen.storyboardc`, keeping `UILaunchStoryboardName`; others fall back to `UILaunchScreen` with a warning. Device builds embed the target's `CODE_SIGN_ENTITLEMENTS` (and extensions' own) in the ad-hoc signature, and `xcross flutter run` enables the matching App ID capabilities. `UIDeviceFamily` follows `TARGETED_DEVICE_FAMILY`, and `PkgInfo`, the `DT*` Xcode/SDK keys and SwiftPM plugin resource bundles (privacy manifests) are added as Xcode does: resources copied from their sources (so SDWebImage's symlinked privacy manifest is a real file again), only bundles of linked targets, Xcode's bundle `Info.plist`, `.xib` resources compiled to the `.nib` `ibtool` writes, and repository line endings on Windows. The project's `AppDelegate.swift` and `SceneDelegate.swift` are still not compiled, which the README now documents. ([#149](https://github.com/arxdeus/xcross/issues/149))
+
+## 2.0.9
+
+- Strip native asset frameworks with `llvm-strip` in release and profile builds. Flutter's `install_code_assets` runs the `strip` found on PATH, which on Linux is GNU strip and fails on Mach-O (`file format not recognized`) for code assets such as `super_native_extensions`. ([#141](https://github.com/arxdeus/xcross/issues/141), [#142](https://github.com/arxdeus/xcross/pull/142))
+- `xcross setup` on Linux no longer accepts a PATH `ld64.lld` that cannot link for iOS (such as the Swift toolchain's) as the fixed linker, so it installs lld 19+ instead of falling back to an older lld that miswires Objective-C selector stubs. ([#142](https://github.com/arxdeus/xcross/pull/142))
+
+## 2.0.8
+
+- Match a development certificate's serial against the team's certificate list locally. Apple's Developer Services returns an empty page for `filter[serialNumber]`, so after issuing a certificate xcross failed with "Development certificate serial … is not on the team after issuance" and a later run could revoke the team's certificates. ([#140](https://github.com/arxdeus/xcross/pull/140))
+
+## 2.0.7
+
+- Default Apple ID login to Omnisette Mac anisette (`https://mac-ani.jkcoxson.com`, overridable with `--anisette-url` / `XCROSS_ANISETTE_URL`) because Apple’s GSA now rejects Android-identifying clients (`-80046`). `--adi-library-dir` remains a legacy opt-in to local Android ADI.
+- Add `xcross compose build --framework` to build only the Kotlin/Native framework of a Compose Multiplatform project, whatever entry point its sources declare. A host app that xcross does not assemble, such as a SwiftPM package built with xtool, links the framework itself; before, a project with a Kotlin `ComposeUIViewController` entry always compiled an Objective-C runner against it, which fails when that entry is not a top-level `MainViewController()` function.
+- Pin the Kotlin/Native 2.4.20 archive digests, so `xcross compose setup` installs the compiler for projects on Kotlin 2.4.20 instead of refusing with "No pinned SHA-256 digest".
+
+## 2.0.6
+
+- Reuse an existing pymobiledevice3 pairing for wireless runs. xcross now looks for `remote_<UDID>.plist` in `~/.pymobiledevice3` (and `$XDG_DATA_HOME/pymobiledevice3` on Linux) instead of `$HOME`, so wireless runs on iOS 27+ no longer re-advertise for device-initiated pairing after `lockdown remotepairing --pair` over USB, and saved-pairing reconnects in `xcross tunnel --wifi` work again. ([#132](https://github.com/arxdeus/xcross/pull/132))
+
+## 2.0.5
+
+- Sign in to Apple again after GrandSlam began refusing (-80045) sign-ins whose client info platform does not match the anisette: xcross now presents Android client info matching its Android-derived local anisette. Apple Root CA - G3 is trusted for `gsd.apple.com` on Linux and Windows, and the HTTP 403 Apple now returns for SMS two-factor under Android anisette is explained with a fix (add a trusted Apple device). ([#127](https://github.com/arxdeus/xcross/pull/127))
+
+## 2.0.4
+
+- Find the python that a pipx (or other virtualenv) install of `pymobiledevice3` runs on when starting the RSD tunnel daemon. xcross no longer warns "no python >= 3.13 with pymobiledevice3 found" when the CLI's own interpreter is 3.13 or newer, and candidate interpreters are probed concurrently. ([#121](https://github.com/arxdeus/xcross/issues/121))
+
+## 2.0.3
+
+- Build and run Flutter iOS apps in `--profile` and `--release` mode from Linux, Windows and macOS, x64 and arm64, like `flutter build ios`/`flutter run`: whole-program AOT kernels with flutter_tools' arguments and Dart plugin registrant, `App.framework` from the iOS `gen_snapshot` (on Linux and Windows the compiler [arxdeus/xcross_gen_snapshot](https://github.com/arxdeus/xcross_gen_snapshot) builds for that Flutter version and proves byte-identical to Flutter's), dSYMs next to the `.app`, `--split-debug-info` and `--obfuscate`. Profile runs serve the VM Service for DevTools.
+- Revalidate a cached iOS `gen_snapshot` against its release once a day, so a compiler republished for the same Flutter version replaces the cached one; offline builds keep using the verified cache. A manifest schema newer than this xcross asks for `xcross update`.
+- Add `xcross flutter precache` to fetch iOS engine artifacts and AOT compilers ahead of the first build, and report in `xcross flutter doctor` whether a release and profile compiler is shipped, cached, pinned, published, or missing.
+- Add `xcross cache prune` to remove cached Flutter engine artifacts and AOT compilers for engines no discoverable Flutter SDK uses (`--dry-run`, `--older-than <days>`).
+
+## 2.0.2
+
+- Sign apps that embed resource-only `.bundle` directories, such as `GoogleCastCoreResources.bundle` inside `GoogleCast.framework` or SwiftPM `<Package>_<Target>.bundle` resource bundles. Device runs no longer fail at "Signing app" with "unsupported nested code bundle". These bundles hold no code, so they are sealed as resources of the enclosing bundle like `codesign` does. A `.bundle` that declares an executable or contains Mach-O code is still rejected. ([#118](https://github.com/arxdeus/xcross/issues/118))
+- Exit as soon as a command finishes. A leftover stdin subscription, socket, HTTP client, timer or child process (for example after `q` in a run session or an auth failure) no longer keeps the CLI hanging. ([#112](https://github.com/arxdeus/xcross/pull/112))
+- Stop Windows plugin builds failing with "could not build Objective-C module 'UIKit'" or "module 'UIKit' is defined in both". The SDK Clang modules the plugins import are now built once before the parallel build, and a build that still loses a module cache race is retried. ([#117](https://github.com/arxdeus/xcross/pull/117))
+- Retry a Windows `swift package resolve` that crashes with an access violation (`0xC0000005`) on large plugin graphs. ([#114](https://github.com/arxdeus/xcross/pull/114))
+
+## 2.0.1
+
+- Resolve `packages/<package>/...` shader and font paths in a package's `pubspec.yaml` inside that package's `lib/` directory, like `flutter build`. Apps depending on `material_ui` (for example through `cached_network_image`) no longer fail with "shader not found: packages/material_ui/packages/material_ui/shaders/ink_sparkle.frag". ([#110](https://github.com/arxdeus/xcross/issues/110))
+
+## 2.0.0
+
+- **Breaking:** split `xcross clean` into per-area commands. `xcross flutter clean` clears the project's native asset and SwiftPM build caches (what `xcross clean` used to do, now for both device and simulator targets). `xcross compose clean` clears the Compose project's xcross build output and Kotlin/Native caches. `xcross sdk clean` removes the installed Darwin Swift SDK along with leftover backup and staging copies. The top-level `xcross clean` is gone.
+- **Breaking:** rename `xcross auth clear` to `xcross auth clean`. The old spelling now fails with a pointer to the new one.
+- **Breaking:** replace `xcross doctor` with `xcross flutter doctor` and `xcross compose doctor`, each checking only the dependencies its own framework needs.
+- **Breaking:** require Swift 6.4 or newer on Linux and Windows. `setup`, `sdk install` and `doctor` reject older swift.org toolchains. macOS stays on the Xcode-paired Swift.
+- **Breaking:** resolve SwiftPM dependencies natively. xcross no longer clones URL dependencies or rewrites them to path dependencies. SwiftPM resolves the whole plugin graph itself and an xcross manifest compiler applies host fixes to every manifest it evaluates, without touching `Package.swift`.
+- Run on a device without a network after the first online run. When Apple's Developer Services cannot be reached, or the saved Apple ID session has expired, xcross signs with the cached certificate and provisioning profile for that app instead of failing, and says what to do when the cache cannot cover the run (no profile yet, device not in it, expired). `XCROSS_OFFLINE=1` skips Apple entirely. A 20-second cap on the Apple ID access check keeps a dead network from stalling the run.
+- Ask on an app's first device build whether to register the original bundle id or an `XCR-` prefixed one, and save the answer as `bundle_id` under `xcross:` in `pubspec.yaml` (or in `xcross_project.yaml` for Compose). CI and IDE debug sessions use the saved value, falling back to the prefixed id only when nothing is saved. `XCROSS_BUNDLE_ID=original|prefixed` overrides it for a run.
+- Stop reusing Flutter SDK engine artifacts left over from an older engine. After a Flutter upgrade on Linux or Windows, `flutter precache --ios` artifacts are never refreshed, so xcross shipped a stale `Flutter.framework` that rejected the app kernel with "Invalid SDK hash" and showed a black screen. xcross now reuses SDK iOS artifacts on Linux and Windows only when the framework's `FlutterEngine` revision matches the SDK engine (Flutter rewrites `ios-sdk.stamp` there without refreshing the files, so the stamp is only trusted on macOS). Host snapshots and the patched SDK are checked against `flutter_sdk.stamp`. Mismatched artifacts are fetched into the xcross cache with a one-time warning naming the refresh command, and a Dart SDK from another engine is flagged too. ([#93](https://github.com/arxdeus/xcross/issues/93))
+- Group doctor output into project, toolchain, and deployment sections with a status header, aligned rows, dimmed locations, and a spinner while each section runs.
+- List every Compose requirement individually in `xcross compose doctor`, and report a missing Kotlin/Native download as a warning since the first build fetches it.
+- Build, sign, self-update and install natively on Windows ARM64, including Apple ID login through ADI. `install.ps1` picks the ARM64 asset even from an emulated x64 PowerShell, and releases ship `xcross-windows-arm64.zip`.
+- Compile Flutter shaders with the host `impellerc` like `flutter build`, so ink sparkle, stretch and app or package `shaders:` entries load at runtime. Tree shake icon fonts in profile and release builds behind `--[no-]tree-shake-icons`.
+- Expand SwiftUI, `#Preview` (including UIKit and widget previews) and FoundationModels macros through the Open Apple Macros server. Release bundles ship it prebuilt from the pinned [arxdeus/OpenAppleMacros](https://github.com/arxdeus/OpenAppleMacros) fork, so the first build no longer compiles swift-syntax. Source and `pub` installs build the pinned revision once and cache it. `tools.OpenAppleMacrosServer` points xcross at another server.
+- Split Windows setup into winget, Scoop, Chocolatey and direct scripts, confirm setup scripts before running them, and install the pinned LLVM into `XCROSS_LLVM_DIR` when another LLVM is on `PATH`.
+- Preserve Flutter package licenses across iOS builds, for apps with and without native hooks, keeping compiler definitions and flavors. ([#94](https://github.com/arxdeus/xcross/pull/94))
+- Keep the banner link visible on dark Linux terminal themes. ([#80](https://github.com/arxdeus/xcross/issues/80))
+
 ## 1.5.1
 
 - Resolve the Dart launcher per host platform in `xcross update`, and harden launcher resolution and batch launches.

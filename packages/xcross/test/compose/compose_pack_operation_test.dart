@@ -1,18 +1,84 @@
 import 'dart:io';
 
+import 'package:cli_kit/host/linux/linux_host.dart';
+import 'package:cli_kit/shared/platform/platform_host.dart';
+import 'package:cli_kit/shared/process/process.dart';
 import 'package:path/path.dart' as p;
 import 'package:test/test.dart';
-import 'package:xcross/src/compose/build/compose_pack_operation.dart';
-import 'package:xcross/src/compose/build/compose_packer.dart';
-import 'package:xcross/src/compose/build/gradle_klib_builder.dart';
-import 'package:xcross/src/compose/models/compose_build_options.dart';
-import 'package:xcross/src/compose/project/kmp_project.dart';
-import 'package:xcross/src/compose/toolchain/compose_host.dart';
-import 'package:xcross/src/compose/toolchain/compose_toolchain.dart';
-import 'package:xcross/src/errors.dart';
-import 'package:xcross/src/models/pack_result.dart';
+import 'package:xcross/src/host/linux/compose/linux_compose_host.dart';
+import 'package:xcross/src/shared/compose/build/compose_pack_operation.dart';
+import 'package:xcross/src/shared/compose/build/compose_packer.dart';
+import 'package:xcross/src/shared/compose/build/gradle_klib_builder.dart';
+import 'package:xcross/src/shared/compose/models/compose_build_options.dart';
+import 'package:xcross/src/shared/compose/project/kmp_project.dart';
+import 'package:xcross/src/shared/compose/swift/swift_import.dart';
+import 'package:xcross/src/shared/compose/swiftpm/host_package_link.dart';
+import 'package:xcross/src/shared/compose/swiftpm/swift_package_model.dart';
+import 'package:xcross/src/shared/compose/toolchain/compose_toolchain.dart';
+import 'package:xcross/src/shared/errors/errors.dart';
+import 'package:xcross/src/shared/models/pack_result.dart';
+import 'package:xcross/src/shared/swiftpm/package_types.dart';
+import 'package:xcross/src/target/shared/compose/compose_target.dart';
+
+import 'support/compose_platforms.dart';
 
 void main() {
+  late ComposeTestSession session;
+  setUp(() {
+    session = createComposeTestSession();
+  });
+  tearDown(() => session.dispose());
+  test(
+    testOn: '!windows',
+
+    'cleanup uses the selected remapped filesystem, not ambient paths',
+    () async {
+      final root = Directory.systemTemp.createTempSync(
+        'compose-remapped-cleanup-',
+      );
+      addTearDown(() => root.deleteSync(recursive: true));
+      final files = RemappedComposeFileSystem(root.path);
+      final host = LinuxHost(architecture: 'x64', fileSystem: files);
+      final target = fixtureIPhoneTargetFor(LinuxComposeHost(host));
+      final project = _project('/virtual-compose', KmpEntryKind.swiftApp);
+      final app = files.directory('/virtual-compose/build/xcross-ios/Demo.app')
+        ..createSync(recursive: true);
+      final framework = files.directory(
+        '/virtual-compose/build/xcross-ios/Shared.framework',
+      )..createSync(recursive: true);
+      files.requests.clear();
+      final operation = ComposePackOperation.withSeams(
+        target,
+        runner: ProcessRunner(
+          host,
+          log: session.fixtureLog,
+          stdinStream: const Stream<List<int>>.empty(),
+          stdoutSink: session.stdoutSink,
+          stderrSink: session.stderrSink,
+        ),
+        tools: session.fixtureToolsFor(host),
+        sdkRepository: session.fixtureSdkRepositoryFor(host),
+        log: session.fixtureLog,
+        downloader: session.fixtureDownloader,
+        currentDirectory: () => '/virtual-compose',
+        detectProject: (path, {bundleId, appName, gradleTarget = 'iosArm64'}) =>
+            project,
+        packProject: ({required project, required options}) async =>
+            PackResult(outputPath: 'Demo.app', bundleId: project.bundleId),
+      );
+      await operation.pack(options: const ComposeBuildOptions());
+      expect(app.existsSync(), isFalse);
+      expect(framework.existsSync(), isFalse);
+      expect(
+        files.requests,
+        containsAll([
+          '/virtual-compose/build/xcross-ios/Demo.app',
+          '/virtual-compose/build/xcross-ios/Shared.framework',
+        ]),
+      );
+    },
+  );
+
   group('ComposePackOperation', () {
     late Directory root;
 
@@ -24,56 +90,281 @@ void main() {
       if (root.existsSync()) root.deleteSync(recursive: true);
     });
 
-    test('detects, deletes stale outputs, then delegates packing', () async {
-      final events = <String>[];
-      final project = _project(root.path, KmpEntryKind.runnableApp);
-      final staleApp = Directory(
-        p.join(root.path, 'build', 'xcross-ios', '${project.appName}.app'),
-      )..createSync(recursive: true);
-      File(p.join(staleApp.path, 'stale')).writeAsStringSync('stale');
-      final staleFramework = Directory(
-        p.join(
-          root.path,
-          'build',
-          'xcross-ios',
-          '${project.baseName}.framework',
-        ),
-      )..createSync(recursive: true);
-      File(p.join(staleFramework.path, 'stale')).writeAsStringSync('stale');
-
+    Future<void> selectedModuleCase(
+      ComposeTarget<PlatformHostInterface> target,
+      String module,
+    ) async {
+      File(
+        p.join(root.path, 'settings.gradle.kts'),
+      ).writeAsStringSync('include(":device", ":simulator")');
+      for (final entry in {
+        'device': 'iosArm64',
+        'simulator': 'iosSimulatorArm64',
+      }.entries) {
+        File(p.join(root.path, entry.key, 'build.gradle.kts'))
+          ..createSync(recursive: true)
+          ..writeAsStringSync('''
+kotlin {
+  ${entry.value}()
+  binaries.framework { baseName = "${entry.key}" }
+}
+''');
+      }
       final operation = ComposePackOperation.withSeams(
+        target,
+        log: session.fixtureLog,
+        runner: session.fixtureProcessRunner(target.host),
+        sdkRepository: session.fixtureSdkRepositoryFor(target.host),
+        tools: session.fixtureToolsFor(target.host),
+        downloader: session.fixtureDownloader,
         currentDirectory: () => root.path,
-        detectProject: (path, {bundleId, appName}) {
-          events.add('detect:$path:$bundleId:$appName');
-          return project;
-        },
         packProject: ({required project, required options}) async {
-          events.add('pack');
-          expect(staleApp.existsSync(), isFalse);
-          expect(staleFramework.existsSync(), isFalse);
-          return PackResult(outputPath: 'App.app', bundleId: project.bundleId);
+          expect(project.moduleName, module);
+          return PackResult(
+            outputPath: '${project.baseName}.framework',
+            bundleId: project.bundleId,
+            kind: PackOutputKind.framework,
+          );
         },
       );
+      await operation.pack(options: const ComposeBuildOptions());
+    }
 
-      final result = await operation.pack(
-        options: const ComposeBuildOptions(
-          bundleId: 'dev.example.override',
-          appName: 'OverrideApp',
+    Future<void> missingTargetCase(
+      ComposeTarget<PlatformHostInterface> target,
+      ComposeTarget<PlatformHostInterface> other,
+    ) async {
+      const options = ComposeBuildOptions();
+      File(
+        p.join(root.path, 'settings.gradle.kts'),
+      ).writeAsStringSync('include(":shared")');
+      File(p.join(root.path, 'shared', 'build.gradle.kts'))
+        ..createSync(recursive: true)
+        ..writeAsStringSync('''
+kotlin {
+  ${other.gradleTarget}()
+  binaries.framework { baseName = "Shared" }
+}
+''');
+      final stale =
+          File(
+              p.join(
+                root.path,
+                'build',
+                target.outputDirectory,
+                'Shared.framework',
+                'stale',
+              ),
+            )
+            ..createSync(recursive: true)
+            ..writeAsStringSync('preserve');
+      final operation = ComposePackOperation.withSeams(
+        target,
+        log: session.fixtureLog,
+        runner: session.fixtureProcessRunner(target.host),
+        sdkRepository: session.fixtureSdkRepositoryFor(target.host),
+        tools: session.fixtureToolsFor(target.host),
+        downloader: session.fixtureDownloader,
+        currentDirectory: () => root.path,
+        packProject: ({required project, required options}) async =>
+            fail('missing selected target must not reach packing'),
+      );
+      await expectLater(
+        operation.pack(options: options),
+        throwsA(
+          isA<XcrossError>().having(
+            (error) => error.message,
+            'message',
+            contains('No KMP module with ${target.gradleTarget}()'),
+          ),
         ),
       );
+      expect(stale.readAsStringSync(), 'preserve');
+    }
 
-      expect(events, [
-        'detect:${root.path}:dev.example.override:OverrideApp',
-        'pack',
-      ]);
-      expect(result.kind, PackOutputKind.app);
-    });
+    test(
+      testOn: '!windows',
+
+      'selects device module before pack',
+      () => selectedModuleCase(session.fixtureIPhoneTarget, 'device'),
+    );
+    test(
+      testOn: '!windows',
+
+      'selects simulator module before pack',
+      () => selectedModuleCase(session.fixtureSimulatorTarget, 'simulator'),
+    );
+    test(
+      testOn: '!windows',
+
+      'missing selected device target preserves outputs before pack',
+      () => missingTargetCase(
+        session.fixtureIPhoneTarget,
+        session.fixtureSimulatorTarget,
+      ),
+    );
+    test(
+      testOn: '!windows',
+
+      'missing selected simulator target preserves outputs before pack',
+      () => missingTargetCase(
+        session.fixtureSimulatorTarget,
+        session.fixtureIPhoneTarget,
+      ),
+    );
+
+    test(
+      testOn: '!windows',
+
+      'simulator pack leaves device outputs and rejects IPA before detection',
+      () async {
+        final project = _project(root.path, KmpEntryKind.runnableApp);
+        final device =
+            File(p.join(root.path, 'build', 'xcross-ios', 'Demo.app', 'Runner'))
+              ..createSync(recursive: true)
+              ..writeAsStringSync('device');
+        final stale =
+            File(
+                p.join(
+                  root.path,
+                  'build',
+                  'xcross-ios-simulator',
+                  'Demo.app',
+                  'Runner',
+                ),
+              )
+              ..createSync(recursive: true)
+              ..writeAsStringSync('simulator');
+        var detections = 0;
+        final operation = ComposePackOperation.withSeams(
+          session.fixtureSimulatorTarget,
+          log: session.fixtureLog,
+          runner: ProcessRunner(
+            log: session.fixtureLog,
+            session.fixtureSimulatorTarget.host,
+            stdinStream: const Stream<List<int>>.empty(),
+            stdoutSink: session.stdoutSink,
+            stderrSink: session.stderrSink,
+          ),
+          tools: session.fixtureToolsFor(session.fixtureSimulatorTarget.host),
+          sdkRepository: session.fixtureSdkRepositoryFor(
+            session.fixtureSimulatorTarget.host,
+          ),
+          downloader: session.fixtureDownloader,
+          currentDirectory: () => root.path,
+          detectProject:
+              (path, {bundleId, appName, gradleTarget = 'iosArm64'}) {
+                detections++;
+                expect(gradleTarget, 'iosSimulatorArm64');
+                return project;
+              },
+          packProject: ({required project, required options}) async {
+            expect(stale.existsSync(), isFalse);
+            expect(device.readAsStringSync(), 'device');
+            return PackResult(
+              outputPath: 'simulator.app',
+              bundleId: project.bundleId,
+            );
+          },
+        );
+        await expectLater(
+          operation.pack(options: const ComposeBuildOptions(ipa: true)),
+          throwsA(isA<XcrossError>()),
+        );
+        expect(detections, 0);
+        await operation.pack(options: const ComposeBuildOptions());
+        expect(detections, 1);
+        expect(device.readAsStringSync(), 'device');
+      },
+    );
+
+    test(
+      testOn: '!windows',
+      'detects, deletes stale outputs, then delegates packing',
+      () async {
+        final events = <String>[];
+        final project = _project(root.path, KmpEntryKind.runnableApp);
+        final staleApp = Directory(
+          p.join(root.path, 'build', 'xcross-ios', '${project.appName}.app'),
+        )..createSync(recursive: true);
+        File(p.join(staleApp.path, 'stale')).writeAsStringSync('stale');
+        final staleFramework = Directory(
+          p.join(
+            root.path,
+            'build',
+            'xcross-ios',
+            '${project.baseName}.framework',
+          ),
+        )..createSync(recursive: true);
+        File(p.join(staleFramework.path, 'stale')).writeAsStringSync('stale');
+
+        final operation = ComposePackOperation.withSeams(
+          session.fixtureIPhoneTarget,
+          log: session.fixtureLog,
+          runner: ProcessRunner(
+            log: session.fixtureLog,
+            session.fixtureIPhoneTarget.host,
+            stdinStream: const Stream<List<int>>.empty(),
+            stdoutSink: session.stdoutSink,
+            stderrSink: session.stderrSink,
+          ),
+          tools: session.fixtureTools,
+          sdkRepository: session.fixtureSdkRepositoryFor(
+            session.fixtureIPhoneTarget.host,
+          ),
+          downloader: session.fixtureDownloader,
+          currentDirectory: () => root.path,
+          detectProject:
+              (path, {bundleId, appName, gradleTarget = 'iosArm64'}) {
+                expect(gradleTarget, 'iosArm64');
+                events.add('detect:$path:$bundleId:$appName');
+                return project;
+              },
+          packProject: ({required project, required options}) async {
+            events.add('pack');
+            expect(staleApp.existsSync(), isFalse);
+            expect(staleFramework.existsSync(), isFalse);
+            return PackResult(
+              outputPath: 'App.app',
+              bundleId: project.bundleId,
+            );
+          },
+        );
+
+        final result = await operation.pack(
+          options: const ComposeBuildOptions(
+            bundleId: 'dev.example.override',
+            appName: 'OverrideApp',
+          ),
+        );
+
+        expect(events, [
+          'detect:${root.path}:dev.example.override:OverrideApp',
+          'pack',
+        ]);
+        expect(result.kind, PackOutputKind.app);
+      },
+    );
 
     test('rejects framework-only run before toolchain work', () async {
       final events = <String>[];
       final operation = ComposePackOperation.withSeams(
+        session.fixtureIPhoneTarget,
+        log: session.fixtureLog,
+        runner: ProcessRunner(
+          log: session.fixtureLog,
+          session.fixtureIPhoneTarget.host,
+          stdinStream: const Stream<List<int>>.empty(),
+          stdoutSink: session.stdoutSink,
+          stderrSink: session.stderrSink,
+        ),
+        tools: session.fixtureTools,
+        sdkRepository: session.fixtureSdkRepositoryFor(
+          session.fixtureIPhoneTarget.host,
+        ),
+        downloader: session.fixtureDownloader,
         currentDirectory: () => root.path,
-        detectProject: (path, {bundleId, appName}) {
+        detectProject: (path, {bundleId, appName, gradleTarget = 'iosArm64'}) {
           events.add('detect');
           return _project(root.path, KmpEntryKind.frameworkOnly);
         },
@@ -106,8 +397,22 @@ void main() {
     test('rejects framework-only ipa before toolchain work', () async {
       final events = <String>[];
       final operation = ComposePackOperation.withSeams(
+        session.fixtureIPhoneTarget,
+        log: session.fixtureLog,
+        runner: ProcessRunner(
+          log: session.fixtureLog,
+          session.fixtureIPhoneTarget.host,
+          stdinStream: const Stream<List<int>>.empty(),
+          stdoutSink: session.stdoutSink,
+          stderrSink: session.stderrSink,
+        ),
+        tools: session.fixtureTools,
+        sdkRepository: session.fixtureSdkRepositoryFor(
+          session.fixtureIPhoneTarget.host,
+        ),
+        downloader: session.fixtureDownloader,
         currentDirectory: () => root.path,
-        detectProject: (path, {bundleId, appName}) {
+        detectProject: (path, {bundleId, appName, gradleTarget = 'iosArm64'}) {
           events.add('detect');
           return _project(root.path, KmpEntryKind.frameworkOnly);
         },
@@ -127,6 +432,104 @@ void main() {
       );
       expect(events, ['detect']);
     });
+
+    test(
+      'builds only the framework when asked, whatever the entry point',
+      () async {
+        // A POSIX root like the fixture host's own paths: the Linux fixture host
+        // cannot address the real temporary directory on a Windows runner, and
+        // this case needs no files, only the stale-output check finding none.
+        const projectRoot = '/virtual-compose';
+        final events = <String>[];
+        late KmpEntryKind packed;
+        final operation = ComposePackOperation.withSeams(
+          session.fixtureIPhoneTarget,
+          log: session.fixtureLog,
+          runner: ProcessRunner(
+            log: session.fixtureLog,
+            session.fixtureIPhoneTarget.host,
+            stdinStream: const Stream<List<int>>.empty(),
+            stdoutSink: session.stdoutSink,
+            stderrSink: session.stderrSink,
+          ),
+          tools: session.fixtureTools,
+          sdkRepository: session.fixtureSdkRepositoryFor(
+            session.fixtureIPhoneTarget.host,
+          ),
+          downloader: session.fixtureDownloader,
+          currentDirectory: () => projectRoot,
+          detectProject:
+              (path, {bundleId, appName, gradleTarget = 'iosArm64'}) {
+                events.add('detect');
+                return _project(projectRoot, KmpEntryKind.swiftApp);
+              },
+          packProject: ({required project, required options}) async {
+            events.add('pack');
+            packed = project.entryKind;
+            return PackResult(
+              outputPath: 'Shared.framework',
+              bundleId: project.bundleId,
+              kind: PackOutputKind.framework,
+            );
+          },
+        );
+
+        final result = await operation.pack(
+          options: const ComposeBuildOptions(frameworkOnly: true),
+        );
+
+        expect(events, ['detect', 'pack']);
+        expect(packed, KmpEntryKind.frameworkOnly);
+        expect(result.kind, PackOutputKind.framework);
+      },
+    );
+
+    test('rejects a framework-only ipa before detecting the project', () async {
+      final events = <String>[];
+      final operation = ComposePackOperation.withSeams(
+        session.fixtureIPhoneTarget,
+        log: session.fixtureLog,
+        runner: ProcessRunner(
+          log: session.fixtureLog,
+          session.fixtureIPhoneTarget.host,
+          stdinStream: const Stream<List<int>>.empty(),
+          stdoutSink: session.stdoutSink,
+          stderrSink: session.stderrSink,
+        ),
+        tools: session.fixtureTools,
+        sdkRepository: session.fixtureSdkRepositoryFor(
+          session.fixtureIPhoneTarget.host,
+        ),
+        downloader: session.fixtureDownloader,
+        currentDirectory: () => root.path,
+        detectProject: (path, {bundleId, appName, gradleTarget = 'iosArm64'}) {
+          events.add('detect');
+          return _project(root.path, KmpEntryKind.swiftApp);
+        },
+        packProject: ({required project, required options}) async {
+          events.add('pack');
+          return PackResult(
+            outputPath: 'Shared.framework',
+            bundleId: project.bundleId,
+            kind: PackOutputKind.framework,
+          );
+        },
+      );
+
+      await expectLater(
+        operation.pack(
+          options: const ComposeBuildOptions(frameworkOnly: true, ipa: true),
+        ),
+        throwsA(
+          isA<XcrossError>().having(
+            (error) => error.message,
+            'message',
+            contains('drop --ipa'),
+          ),
+        ),
+      );
+      expect(events, isEmpty);
+    });
   });
 
   group('ComposePacker', () {
@@ -142,6 +545,7 @@ void main() {
         final events = <String>[];
         final project = _project(root.path, KmpEntryKind.runnableApp);
         final packer = _packer(
+          session,
           project: project,
           events: events,
           objcRunner:
@@ -181,6 +585,7 @@ void main() {
       final events = <String>[];
       final project = _project(root.path, KmpEntryKind.swiftApp);
       final packer = _packer(
+        session,
         project: project,
         events: events,
         swiftRunner:
@@ -188,6 +593,7 @@ void main() {
               required project,
               required frameworkPath,
               required toolchain,
+              packages,
             }) async {
               events.add('swift-runner');
               return 'Runner';
@@ -205,6 +611,414 @@ void main() {
       ]);
     });
 
+    group('Swift import preflight', () {
+      KmpProject withImports(String root, List<SwiftImport> imports) {
+        final base = _project(root, KmpEntryKind.swiftApp);
+        return KmpProject(
+          root: base.root,
+          modulePath: base.modulePath,
+          moduleName: base.moduleName,
+          baseName: base.baseName,
+          entryKind: base.entryKind,
+          bundleId: base.bundleId,
+          appName: base.appName,
+          swiftSources: base.swiftSources,
+          swiftImports: imports,
+        );
+      }
+
+      test(
+        'fails before the Kotlin compile naming module and file:line',
+        () async {
+          final events = <String>[];
+          final packer = _packer(
+            session,
+            events: events,
+            project: withImports('/proj', [
+              const SwiftImport(
+                'Sparkle',
+                path: '/proj/iosApp/App.swift',
+                line: 3,
+              ),
+            ]),
+          );
+          await expectLater(
+            packer.pack(),
+            throwsA(
+              isA<XcrossError>().having(
+                (e) => e.message,
+                'message',
+                allOf(
+                  contains('Sparkle'),
+                  contains('${p.join('iosApp', 'App.swift')}:3'),
+                ),
+              ),
+            ),
+          );
+          expect(events, ['toolchain']);
+        },
+      );
+
+      test('conditional imports and the framework itself pass', () async {
+        final events = <String>[];
+        final packer = _packer(
+          session,
+          events: events,
+          project: withImports('/proj', [
+            const SwiftImport(
+              'Sparkle',
+              path: '/proj/App.swift',
+              line: 1,
+              conditional: true,
+            ),
+            const SwiftImport('Shared', path: '/proj/App.swift', line: 2),
+          ]),
+          swiftRunner:
+              ({
+                required project,
+                required frameworkPath,
+                required toolchain,
+                packages,
+              }) async => 'Runner',
+        );
+        await packer.pack();
+        expect(events, contains('gradle-klib'));
+      });
+
+      group('with Swift packages', () {
+        const alamofire = RemoteSwiftPackage(
+          url: 'https://github.com/Alamofire/Alamofire.git',
+          requirement: UpToNextMajorRequirement('5.9.0'),
+        );
+        const declared = HostSwiftPackages(
+          packages: [alamofire],
+          products: [
+            SwiftPackageProductDependency(
+              productName: 'Alamofire',
+              package: alamofire,
+            ),
+            SwiftPackageProductDependency(
+              productName: 'Numerics',
+              package: alamofire,
+            ),
+          ],
+          packageResolvedPath: null,
+          xcodeprojPath: '/proj/iosApp/iosApp.xcodeproj',
+        );
+        const link = HostPackageLink(
+          productName: 'XcrossHostPackages',
+          libraryPath: '/ws/debug/libXcrossHostPackages.dylib',
+          modulesDir: '/ws/debug/Modules',
+          moduleMapFiles: [],
+          frameworkSearchPaths: ['/ws/debug'],
+          build: SwiftPmBuildResult(
+            libraryPath: '/ws/debug/libXcrossHostPackages.dylib',
+            dylibPaths: [],
+            modulesDir: '/ws/debug/Modules',
+          ),
+          modules: {'Alamofire', 'Numerics', 'RealModule'},
+        );
+
+        test('remote packages not fetched yet: an unknown import is left to '
+            'the check after the package build, still before Kotlin', () async {
+          final events = <String>[];
+          final packer = _packer(
+            session,
+            events: events,
+            project: withImports('/proj', [
+              const SwiftImport(
+                'Alamofire',
+                path: '/proj/iosApp/A.swift',
+                line: 3,
+              ),
+              // Transitive module of a declared product (Numerics).
+              const SwiftImport(
+                'RealModule',
+                path: '/proj/iosApp/A.swift',
+                line: 4,
+              ),
+              const SwiftImport(
+                'FirebaseCore',
+                path: '/proj/iosApp/A.swift',
+                line: 5,
+              ),
+            ]),
+            readHostPackages: (_) => declared,
+            buildHostPackages:
+                ({required project, required packages, required toolchain}) {
+                  events.add('packages');
+                  return Future.value(link);
+                },
+          );
+          await expectLater(
+            packer.pack(),
+            throwsA(
+              isA<XcrossError>().having(
+                (e) => e.message,
+                'message',
+                allOf(
+                  contains(
+                    'FirebaseCore (imported at '
+                    '${p.join('iosApp', 'A.swift')}:5)',
+                  ),
+                  isNot(contains('RealModule (')),
+                  isNot(contains('Alamofire (')),
+                  contains(p.join('iosApp', 'iosApp.xcodeproj')),
+                  contains('CocoaPods are not supported'),
+                  contains('#if canImport'),
+                ),
+              ),
+            ),
+          );
+          expect(events, ['toolchain', 'packages']);
+        });
+
+        test('only local packages: fail before the build on an undeclared '
+            'module', () async {
+          const local = LocalSwiftPackage('/proj/Missing/LocalPkg');
+          final events = <String>[];
+          final packer = _packer(
+            session,
+            events: events,
+            project: withImports('/proj', [
+              const SwiftImport(
+                'FirebaseCore',
+                path: '/proj/iosApp/A.swift',
+                line: 5,
+              ),
+            ]),
+            readHostPackages: (_) => const HostSwiftPackages(
+              packages: [local],
+              products: [
+                SwiftPackageProductDependency(
+                  productName: 'LocalPkg',
+                  package: local,
+                ),
+              ],
+              packageResolvedPath: null,
+              xcodeprojPath: '/proj/iosApp/iosApp.xcodeproj',
+            ),
+            buildHostPackages:
+                ({required project, required packages, required toolchain}) {
+                  events.add('packages');
+                  return Future.value(link);
+                },
+          );
+          await expectLater(
+            packer.pack(),
+            throwsA(
+              isA<XcrossError>().having(
+                (e) => e.message,
+                'message',
+                contains(
+                  'FirebaseCore (imported at '
+                  '${p.join('iosApp', 'A.swift')}:5)',
+                ),
+              ),
+            ),
+          );
+          expect(events, ['toolchain']);
+        });
+
+        test('without packages, points at iosApp/*.xcodeproj', () async {
+          final packer = _packer(
+            session,
+            events: [],
+            project: withImports('/proj', [
+              const SwiftImport(
+                'Alamofire',
+                path: '/proj/iosApp/A.swift',
+                line: 3,
+              ),
+            ]),
+          );
+          await expectLater(
+            packer.pack(),
+            throwsA(
+              isA<XcrossError>().having(
+                (e) => e.message,
+                'message',
+                allOf(contains('iosApp/*.xcodeproj'), contains('--framework')),
+              ),
+            ),
+          );
+        });
+
+        test('build before Kotlin, accept modules of a built product, and '
+            'hand the link to the runner and the app', () async {
+          final events = <String>[];
+          HostPackageLink? runnerLink;
+          HostPackageLink? appLink;
+          final packer = _packer(
+            session,
+            events: events,
+            project: withImports('/proj', [
+              const SwiftImport(
+                'Alamofire',
+                path: '/proj/iosApp/A.swift',
+                line: 3,
+              ),
+              const SwiftImport(
+                'Numerics',
+                path: '/proj/iosApp/A.swift',
+                line: 4,
+              ),
+            ]),
+            readHostPackages: (_) => declared,
+            buildHostPackages:
+                ({required project, required packages, required toolchain}) {
+                  events.add('packages');
+                  return Future.value(link);
+                },
+            swiftRunner:
+                ({
+                  required project,
+                  required frameworkPath,
+                  required toolchain,
+                  packages,
+                }) async {
+                  events.add('swift-runner');
+                  runnerLink = packages;
+                  return 'Runner';
+                },
+            assembleApp:
+                ({
+                  required project,
+                  required runnerPath,
+                  required frameworkPath,
+                  packages,
+                }) async {
+                  events.add('assemble');
+                  appLink = packages;
+                  return 'Demo.app';
+                },
+          );
+          await packer.pack();
+          expect(events, [
+            'toolchain',
+            'packages',
+            'gradle-klib',
+            'framework',
+            'swift-runner',
+            'assemble',
+          ]);
+          expect(runnerLink, same(link));
+          expect(appLink, same(link));
+        });
+
+        test('reject an import the built packages do not provide', () async {
+          final events = <String>[];
+          final packer = _packer(
+            session,
+            events: events,
+            project: withImports('/proj', [
+              // A declared product name the build did not turn into a module.
+              const SwiftImport(
+                'Numerics',
+                path: '/proj/iosApp/A.swift',
+                line: 4,
+              ),
+            ]),
+            readHostPackages: (_) => declared,
+            buildHostPackages:
+                ({required project, required packages, required toolchain}) {
+                  events.add('packages');
+                  return Future.value(
+                    const HostPackageLink(
+                      productName: 'XcrossHostPackages',
+                      libraryPath: '/l',
+                      modulesDir: null,
+                      moduleMapFiles: [],
+                      frameworkSearchPaths: [],
+                      build: SwiftPmBuildResult(
+                        libraryPath: '/l',
+                        dylibPaths: [],
+                        modulesDir: null,
+                      ),
+                      modules: {'Alamofire'},
+                    ),
+                  );
+                },
+          );
+          await expectLater(
+            packer.pack(),
+            throwsA(
+              isA<XcrossError>().having(
+                (e) => e.message,
+                'message',
+                contains(
+                  'Numerics (imported at ${p.join('iosApp', 'A.swift')}:4)',
+                ),
+              ),
+            ),
+          );
+          expect(events, ['toolchain', 'packages']);
+        });
+
+        test('no packages: no package step, runner called as before', () async {
+          final events = <String>[];
+          var sawPackages = false;
+          final packer = _packer(
+            session,
+            events: events,
+            project: _project('/proj', KmpEntryKind.swiftApp),
+            buildHostPackages:
+                ({required project, required packages, required toolchain}) {
+                  events.add('packages');
+                  return Future.value(link);
+                },
+            swiftRunner:
+                ({
+                  required project,
+                  required frameworkPath,
+                  required toolchain,
+                  packages,
+                }) async {
+                  sawPackages = packages != null;
+                  return 'Runner';
+                },
+          );
+          await packer.pack();
+          expect(events, isNot(contains('packages')));
+          expect(sawPackages, isFalse);
+        });
+      });
+
+      for (final kind in [
+        KmpEntryKind.runnableApp,
+        KmpEntryKind.frameworkOnly,
+      ]) {
+        test('is skipped for ${kind.name} projects', () async {
+          final base = _project('/proj', kind);
+          final events = <String>[];
+          final packer = _packer(
+            session,
+            events: events,
+            objcRunner:
+                ({
+                  required project,
+                  required frameworkPath,
+                  required toolchain,
+                }) async => 'Runner',
+            project: KmpProject(
+              root: base.root,
+              modulePath: base.modulePath,
+              moduleName: base.moduleName,
+              baseName: base.baseName,
+              entryKind: kind,
+              bundleId: base.bundleId,
+              appName: base.appName,
+              swiftImports: const [
+                SwiftImport('Sparkle', path: '/proj/App.swift', line: 1),
+              ],
+            ),
+          );
+          await packer.pack();
+          expect(events, contains('framework'));
+        });
+      }
+    });
+
     test(
       'returns framework output early for framework-only projects',
       () async {
@@ -216,7 +1030,7 @@ void main() {
         });
         final events = <String>[];
         final project = _project(root.path, KmpEntryKind.frameworkOnly);
-        final packer = _packer(project: project, events: events);
+        final packer = _packer(session, project: project, events: events);
 
         final result = await packer.pack();
 
@@ -236,18 +1050,18 @@ void main() {
       });
       var ensures = 0;
       final packer = _packer(
+        session,
         project: _project(root.path, KmpEntryKind.frameworkOnly),
         events: <String>[],
         ensureToolchain:
             ({
-              required host,
               required environment,
               required projectRoot,
               required allowInstall,
               required force,
             }) async {
               ensures++;
-              return _toolchain;
+              return _toolchain(session);
             },
       );
 
@@ -258,28 +1072,39 @@ void main() {
   });
 }
 
-ComposePacker _packer({
+ComposePacker _packer(
+  ComposeTestSession session, {
   required KmpProject project,
   required List<String> events,
   ComposeEnsureToolchain? ensureToolchain,
-  ComposeBuildObjcRunner? objcRunner,
+  ComposeBuildRunner? objcRunner,
   ComposeBuildSwiftRunner? swiftRunner,
+  ComposeReadHostPackages? readHostPackages,
+  ComposeBuildHostPackages? buildHostPackages,
+  ComposeAssembleApp? assembleApp,
 }) => ComposePacker.withSeams(
+  readHostPackages: readHostPackages ?? ((project) => HostSwiftPackages.empty),
+  buildHostPackages: buildHostPackages,
+  log: session.fixtureLog,
   project: project,
   options: const ComposeBuildOptions(),
-  currentHost: () => ComposeHost.linuxX64,
-  environment: () => const <String, String>{},
+  target: session.fixtureIPhoneTarget,
+  runner: session.fixtureRunner,
+  tools: session.fixtureTools,
+  sdkRepository: session.fixtureSdkRepositoryFor(
+    session.fixtureIPhoneTarget.host,
+  ),
+  downloader: session.fixtureDownloader,
   ensureToolchain:
       ensureToolchain ??
       ({
-        required host,
         required environment,
         required projectRoot,
         required allowInstall,
         required force,
       }) async {
         events.add('toolchain');
-        return _toolchain;
+        return _toolchain(session);
       },
   buildKlib: ({required project, required toolchain}) async {
     events.add('gradle-klib');
@@ -311,12 +1136,23 @@ ComposePacker _packer({
       },
   buildSwiftRunner:
       swiftRunner ??
-      ({required project, required frameworkPath, required toolchain}) async {
+      ({
+        required project,
+        required frameworkPath,
+        required toolchain,
+        packages,
+      }) async {
         events.add('unexpected-swift-runner');
         return 'Runner';
       },
   assembleApp:
-      ({required project, required runnerPath, required frameworkPath}) async {
+      assembleApp ??
+      ({
+        required project,
+        required runnerPath,
+        required frameworkPath,
+        packages,
+      }) async {
         events.add('assemble');
         return p.join(
           project.root,
@@ -340,8 +1176,10 @@ KmpProject _project(String root, KmpEntryKind entryKind) => KmpProject(
       : const [],
 );
 
-const _toolchain = ComposeToolchain(
-  host: ComposeHost.linuxX64,
+ComposeToolchain _toolchain(ComposeTestSession session) => ComposeToolchain(
+  log: session.fixtureLog,
+  target: session.fixtureIPhoneTarget,
+  runner: session.fixtureRunner,
   kotlinHome: '/kotlin',
   konanCache: '/konan-cache',
   konancExecutable: '/kotlin/bin/konanc',

@@ -1,9 +1,13 @@
+@TestOn('!windows')
+library;
+
 import 'dart:io';
 
 import 'package:path/path.dart' as p;
 import 'package:test/test.dart';
-import 'package:xcross/src/flutter/build/ios_bundle_id.dart';
-import 'package:xcross/src/flutter/errors.dart';
+import 'package:xcross/src/shared/errors/build_error.dart';
+
+import '../flutter_test_runtime.dart';
 
 void main() {
   late Directory tmp;
@@ -51,7 +55,10 @@ void main() {
     await writePlist('com.example.Literal');
     await writePbxproj('com.example.FromPbx');
 
-    expect(IosBundleId.resolve(tmp.path), 'com.example.Literal');
+    expect(
+      testIPhoneRuntime().bundleIds.resolve(tmp.path),
+      'com.example.Literal',
+    );
   });
 
   test(
@@ -60,32 +67,40 @@ void main() {
       await writePlist(r'$(PRODUCT_BUNDLE_IDENTIFIER)');
       await writePbxproj('com.example.FromPbx');
 
-      expect(IosBundleId.resolve(tmp.path), 'com.example.FromPbx');
+      expect(
+        testIPhoneRuntime().bundleIds.resolve(tmp.path),
+        'com.example.FromPbx',
+      );
     },
   );
 
   test('reads PRODUCT_BUNDLE_IDENTIFIER when Info.plist is missing', () async {
     await writePbxproj('com.example.OnlyPbx');
 
-    expect(IosBundleId.resolve(tmp.path), 'com.example.OnlyPbx');
+    expect(
+      testIPhoneRuntime().bundleIds.resolve(tmp.path),
+      'com.example.OnlyPbx',
+    );
   });
 
   test('strips optional quotes around PRODUCT_BUNDLE_IDENTIFIER', () async {
     await writePlist(r'$(PRODUCT_BUNDLE_IDENTIFIER)');
     final dir = Directory(p.join(tmp.path, 'ios', 'Runner.xcodeproj'));
     await dir.create(recursive: true);
-    await File(
-      p.join(dir.path, 'project.pbxproj'),
-    ).writeAsString('PRODUCT_BUNDLE_IDENTIFIER = "com.example.Quoted";\n');
+    await File(p.join(dir.path, 'project.pbxproj'))
+        .writeAsString('PRODUCT_BUNDLE_IDENTIFIER = "com.example.Quoted";\n');
 
-    expect(IosBundleId.resolve(tmp.path), 'com.example.Quoted');
+    expect(
+      testIPhoneRuntime().bundleIds.resolve(tmp.path),
+      'com.example.Quoted',
+    );
   });
 
   test('throws when neither plist nor pbxproj yields a bundle id', () {
     expect(
-      () => IosBundleId.resolve(tmp.path),
+      () => testIPhoneRuntime().bundleIds.resolve(tmp.path),
       throwsA(
-        isA<FlutterBuildError>().having(
+        isA<XcrossBuildError>().having(
           (e) => e.message,
           'message',
           contains('Could not resolve iOS bundle identifier'),
@@ -147,7 +162,64 @@ void main() {
 }
 ''');
 
-      expect(IosBundleId.resolve(tmp.path), 'com.example.MainApp');
+      expect(
+        testIPhoneRuntime().bundleIds.resolve(tmp.path),
+        'com.example.MainApp',
+      );
     },
   );
+
+  test('uses the bundle id from the selected flavor configuration', () async {
+    await writePlist(r'$(PRODUCT_BUNDLE_IDENTIFIER)');
+
+    final dir = Directory(p.join(tmp.path, 'ios', 'Runner.xcodeproj'));
+    await dir.create(recursive: true);
+
+    await File(p.join(dir.path, 'project.pbxproj')).writeAsString('''
+{
+archiveVersion = 1;
+objects = {
+  PROJECT = {
+    isa = PBXProject;
+    targets = (
+      APP,
+    );
+  };
+  APP = {
+    isa = PBXNativeTarget;
+    buildConfigurationList = CONFIGS;
+    name = Runner;
+    productType = "com.apple.product-type.application";
+  };
+  CONFIGS = {
+    isa = XCConfigurationList;
+    buildConfigurations = (
+      DEBUG,
+      DEBUG_PROD,
+    );
+  };
+  DEBUG = {
+    isa = XCBuildConfiguration;
+    buildSettings = {
+      PRODUCT_BUNDLE_IDENTIFIER = com.example.Debug;
+    };
+    name = Debug;
+  };
+  DEBUG_PROD = {
+    isa = XCBuildConfiguration;
+    buildSettings = {
+      PRODUCT_BUNDLE_IDENTIFIER = com.example.Prod;
+    };
+    name = "Debug-prod";
+  };
+};
+rootObject = PROJECT;
+}
+''');
+
+    expect(
+      testIPhoneRuntime().bundleIds.resolve(tmp.path, flavor: 'prod'),
+      'com.example.Prod',
+    );
+  });
 }

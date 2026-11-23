@@ -1,0 +1,54 @@
+import 'package:meta/meta.dart';
+
+/// Paths needed to drive Flutter hot reload, shared by the device launcher and
+/// the hot reload controller.
+@internal
+final class HotReloadConfig {
+  const HotReloadConfig({
+    required this.dart,
+    required this.frontendServer,
+    required this.sdkRoot,
+    required this.packageConfig,
+    required this.entrypoint,
+    required this.projectRoot,
+    required this.outputDill,
+    this.dartDefines = const [],
+    this.extraSources = const [],
+    this.verbose = false,
+    this.warmDill,
+  });
+
+  /// Path to the `dart` (or `dartaotruntime`) executable.
+  final String dart;
+
+  /// Path to the `frontend_server` snapshot or AOT kernel.
+  final String frontendServer;
+
+  /// Flutter engine SDK root passed to `frontend_server --sdk-root`.
+  final String sdkRoot;
+
+  /// Path to `.dart_tool/package_config.json`.
+  final String packageConfig;
+
+  /// Dart entrypoint file (absolute path).
+  final String entrypoint;
+
+  /// Flutter project root directory.
+  final String projectRoot;
+
+  /// Output `.dill` path for incremental compilation.
+  final String outputDill;
+
+  /// The build's complete dart-defines (`FlutterBuildContext.dartDefines`)
+  /// as `KEY=VALUE` strings, so a reload compiles with the same
+  /// `FLUTTER_*` values as the installed kernel.
+  final List<String> dartDefines;
+
+  /// Extra kernel `--source` URIs (generated Dart plugin registrant), mirrored
+  /// from the bundle compile so restarted isolates boot identically.
+  final List<String> extraSources;
+
+  /// Whether to emit verbose timing logs.
+  final bool verbose;
+  final String? warmDill;
+}

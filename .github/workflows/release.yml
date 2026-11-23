@@ -9,6 +9,17 @@ on:
 permissions:
   contents: read
 
+env:
+  # Pinned toolchain that builds the bundled OpenAppleMacrosServer. Keep in
+  # sync with integration.yml.
+  SWIFT_VERSION: 6.4.0
+  SWIFT_WINDOWS_X64_SHA256: >-
+    76169A85BCBA82854A0CD8F9655FFB74B3758D60C35A245457510095F2823C03
+  SWIFT_WINDOWS_ARM64_SHA256: >-
+    F48E393634995CB589F547E40D64673BC641CA76B099697BA8227A8904BE4A49
+  SWIFT_STATIC_LINUX_SDK_SHA256: >-
+    47d2fd89eebfdf9eb4d536b6710414297f755c17926cdebc4742c08982b40a9e
+
 jobs:
   build:
     name: Build ${{ matrix.asset }}
@@ -47,18 +58,28 @@ jobs:
       - name: Analyze
         run: dart analyze
 
+      # Run each package from its own directory: `dart test <path>` from the
+      # workspace root does not run that package's build hooks, so native
+      # assets (the ADI bridge) would be missing.
       - name: Test
         run: |
-          dart test packages/xcross
-          dart test packages/cli_kit
-          dart test packages/apple_developer_kit
-          dart test packages/darwin_sdk_kit
-          dart test packages/dart_mobile_device
-          dart test packages/frontend_server_kit
+          set -euo pipefail
+          for package in xcross cli_kit apple_developer_kit darwin_sdk_kit \
+            dart_mobile_device frontend_server_kit; do
+            (cd "packages/$package" && dart test)
+          done
 
       - name: Validate pub.dev package
         working-directory: packages/xcross
         run: dart pub publish --dry-run
+
+      - name: Set up Swift
+        uses: ./.github/actions/setup-swift
+        with:
+          version: ${{ env.SWIFT_VERSION }}
+          windows-x64-sha256: ${{ env.SWIFT_WINDOWS_X64_SHA256 }}
+          windows-arm64-sha256: ${{ env.SWIFT_WINDOWS_ARM64_SHA256 }}
+          static-linux-sdk-sha256: ${{ env.SWIFT_STATIC_LINUX_SDK_SHA256 }}
 
       - name: Build xcross
         working-directory: packages/xcross
@@ -69,14 +90,29 @@ jobs:
           dart run
           "-DXCROSS_VERSION=${XCROSS_BUILD_VERSION}"
           "-DXCROSS_RELEASED=${XCROSS_BUILD_RELEASED}"
+          -DXCROSS_BUNDLE_MACROS=true
           tool/build_xcross.dart
+
+      - name: Smoke-test bundled OpenAppleMacrosServer
+        run: bash .github/scripts/smoke_open_apple_macros.sh packages/xcross/build/cli/*/bundle
+
+      - name: Smoke-test bundled xcrun
+        run: bash .github/scripts/smoke_xcrun.sh packages/xcross/build/cli/*/bundle
 
       - name: Compile binary
         run: |
           mkdir -p dist
-          # Bundle layout is bin/ + lib/ (native assets). Ship as tar.gz.
-          tar -C packages/xcross/build/cli/*/bundle \
-            -czf "dist/${{ matrix.asset }}.tar.gz" bin lib
+          # Bundle layout is bin/ + lib/ (native assets and the macro
+          # server) plus third-party notices. Ship as tar.gz.
+          bundle=$(echo packages/xcross/build/cli/*/bundle)
+          mkdir -p "$bundle/THIRD_PARTY_LICENSES"
+          cp third_party/OpenAppleMacros/LICENSE.md \
+            "$bundle/THIRD_PARTY_LICENSES/OpenAppleMacros.txt"
+          curl --fail --location --retry 3 \
+            https://raw.githubusercontent.com/swiftlang/swift/main/LICENSE.txt \
+            -o "$bundle/THIRD_PARTY_LICENSES/swift.txt"
+          tar -C "$bundle" \
+            -czf "dist/${{ matrix.asset }}.tar.gz" bin lib THIRD_PARTY_LICENSES
 
       - name: Attest build provenance
         if: startsWith(github.ref, 'refs/tags/')
@@ -94,12 +130,24 @@ jobs:
           if-no-files-found: error
 
   build-windows:
-    name: Build xcross-windows-x64
-    runs-on: windows-2022
+    name: Build ${{ matrix.asset }}
+    runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
       id-token: write
       attestations: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-2022
+            asset: xcross-windows-x64
+            architecture: x64
+            cli-dir: windows_x64
+          - runner: windows-11-arm
+            asset: xcross-windows-arm64
+            architecture: arm64
+            cli-dir: windows_arm64
 
     steps:
       - name: Checkout
@@ -108,11 +156,62 @@ jobs:
           persist-credentials: false
           submodules: true
 
+      # Pin the SDK architecture: the AOT executable and the native bridge are
+      # built for the architecture of the Dart SDK that runs the build, so an
+      # emulated x64 SDK on the ARM64 runner would silently ship x64 binaries.
       - name: Set up Dart
         # v1
         uses: dart-lang/setup-dart@65eb853c7ba17dde3be364c3d2858773e7144260
         with:
           sdk: stable
+          architecture: ${{ matrix.architecture }}
+
+      # The Windows ADI bridge is compiled by a Dart build hook through
+      # native_toolchain_c, which resolves MSVC with `vswhere -requires
+      # Microsoft.VisualStudio.Component.VC.Tools.<arch>`. Verify that query
+      # succeeds and add the component when the runner image lacks it.
+      - name: Ensure MSVC tools
+        shell: pwsh
+        env:
+          MSVC_ARCHITECTURE: ${{ matrix.architecture }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $component = switch ($env:MSVC_ARCHITECTURE) {
+            'x64' { 'Microsoft.VisualStudio.Component.VC.Tools.x86.x64' }
+            'arm64' { 'Microsoft.VisualStudio.Component.VC.Tools.ARM64' }
+            default { throw "Unsupported MSVC architecture: $env:MSVC_ARCHITECTURE" }
+          }
+          $installerDir = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer"
+          $vswhere = Join-Path $installerDir 'vswhere.exe'
+          if (-not (Test-Path $vswhere)) {
+            throw "vswhere.exe not found at $vswhere"
+          }
+          function Find-Msvc {
+            & $vswhere -latest -products '*' -requires $component `
+              -property installationPath
+          }
+          $installation = Find-Msvc
+          if (-not $installation) {
+            $visualStudio = & $vswhere -latest -products '*' -property installationPath
+            if (-not $visualStudio) {
+              throw 'No Visual Studio installation found on this runner'
+            }
+            Write-Host "Adding $component to $visualStudio"
+            $process = Start-Process `
+              (Join-Path $installerDir 'vs_installer.exe') `
+              -ArgumentList 'modify', '--installPath', "`"$visualStudio`"", `
+                '--add', $component, '--quiet', '--norestart', '--nocache' `
+              -PassThru `
+              -Wait
+            if ($process.ExitCode -notin 0, 3010) {
+              throw "Visual Studio installer failed: $($process.ExitCode)"
+            }
+            $installation = Find-Msvc
+            if (-not $installation) {
+              throw "$component is still missing after installation"
+            }
+          }
+          Write-Host "MSVC ${env:MSVC_ARCHITECTURE} tools: $installation"
 
       # bash, not the pwsh default: GitHub only propagates $LASTEXITCODE from
       # the final line of a pwsh `run` block, so a failing `dart test` on any
@@ -124,12 +223,18 @@ jobs:
           set -euo pipefail
           dart pub get
           dart analyze
-          dart test packages/xcross
-          dart test packages/cli_kit
-          (cd packages/apple_developer_kit && dart test)
-          dart test packages/darwin_sdk_kit
-          dart test packages/dart_mobile_device
-          dart test packages/frontend_server_kit
+          for package in xcross cli_kit apple_developer_kit darwin_sdk_kit \
+            dart_mobile_device frontend_server_kit; do
+            (cd "packages/$package" && dart test)
+          done
+
+      - name: Set up Swift
+        uses: ./.github/actions/setup-swift
+        with:
+          version: ${{ env.SWIFT_VERSION }}
+          windows-x64-sha256: ${{ env.SWIFT_WINDOWS_X64_SHA256 }}
+          windows-arm64-sha256: ${{ env.SWIFT_WINDOWS_ARM64_SHA256 }}
+          static-linux-sdk-sha256: ${{ env.SWIFT_STATIC_LINUX_SDK_SHA256 }}
 
       - name: Build xcross
         shell: pwsh
@@ -141,16 +246,27 @@ jobs:
           dart run `
             "-DXCROSS_VERSION=$env:XCROSS_BUILD_VERSION" `
             "-DXCROSS_RELEASED=$env:XCROSS_BUILD_RELEASED" `
+            -DXCROSS_BUNDLE_MACROS=true `
             tool/build_xcross.dart
+
+      - name: Smoke-test bundled OpenAppleMacrosServer
+        shell: bash
+        run: bash .github/scripts/smoke_open_apple_macros.sh "packages/xcross/build/cli/${{ matrix.cli-dir }}/bundle"
+
+      - name: Smoke-test bundled xcrun
+        shell: bash
+        run: bash .github/scripts/smoke_xcrun.sh "packages/xcross/build/cli/${{ matrix.cli-dir }}/bundle"
 
       - name: Compile binary
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force dist | Out-Null
-          Copy-Item -Recurse `
-            packages/xcross/build/cli/windows_x64/bundle/bin dist/bin
-          Copy-Item -Recurse `
-            packages/xcross/build/cli/windows_x64/bundle/lib dist/lib
+          $bundle = "packages/xcross/build/cli/${{ matrix.cli-dir }}/bundle"
+          if (-not (Test-Path "$bundle/bin/xcross.exe")) {
+            throw "Missing $bundle; build produced: $(Get-ChildItem packages/xcross/build/cli -Name)"
+          }
+          Copy-Item -Recurse "$bundle/bin" dist/bin
+          Copy-Item -Recurse "$bundle/lib" dist/lib
 
       - name: Package Windows release
         shell: pwsh
@@ -162,26 +278,55 @@ jobs:
           Copy-Item `
             packages/apple_developer_kit/ADI_LICENSE `
             dist/THIRD_PARTY_LICENSES/provision-dart.txt
-          Compress-Archive -Path dist/* -DestinationPath xcross-windows-x64.zip
+          Copy-Item `
+            third_party/OpenAppleMacros/LICENSE.md `
+            dist/THIRD_PARTY_LICENSES/OpenAppleMacros.txt
+          # The bundled server statically includes swift-syntax and, on
+          # Windows, ships the Swift runtime DLLs: both Apache 2.0 with the
+          # Runtime Library Exception.
+          Invoke-WebRequest `
+            https://raw.githubusercontent.com/swiftlang/swift/main/LICENSE.txt `
+            -OutFile dist/THIRD_PARTY_LICENSES/swift.txt
+          Compress-Archive -Path dist/* -DestinationPath "${{ matrix.asset }}.zip"
 
       - name: Smoke-test Windows archive
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          Expand-Archive xcross-windows-x64.zip smoke
-          $expected = @(
+          Expand-Archive "${{ matrix.asset }}.zip" smoke
+          $required = @(
             'LICENSE'
+            'THIRD_PARTY_LICENSES/OpenAppleMacros.txt'
             'THIRD_PARTY_LICENSES/provision-dart.txt'
+            'THIRD_PARTY_LICENSES/swift.txt'
             'bin/xcross.exe'
             'bin/xcrun.exe'
+            'lib/OpenAppleMacrosServer.exe'
+            'lib/swiftCore.dll'
             'lib/sysv_abi_bridge.dll'
           ) | Sort-Object
           $root = Resolve-Path smoke
           $actual = Get-ChildItem smoke -File -Recurse | ForEach-Object {
             [IO.Path]::GetRelativePath($root, $_.FullName).Replace('\', '/')
           } | Sort-Object
-          if (Compare-Object $expected $actual) {
-            throw "Unexpected archive contents: $actual"
+          $missing = $required | Where-Object { $_ -notin $actual }
+          if ($missing) { throw "Archive is missing: $missing" }
+          # Anything beyond the required set must be a Swift runtime DLL the
+          # bundled server loads from lib/.
+          $extra = $actual | Where-Object { $_ -notin $required }
+          $unexpected = $extra | Where-Object { $_ -notmatch '^lib/[^/]+\.dll$' }
+          if ($unexpected) { throw "Unexpected archive contents: $unexpected" }
+
+          # IMAGE_FILE_HEADER.Machine: 0x8664 is x64, 0xAA64 is ARM64.
+          $expectedMachine = @{ x64 = 0x8664; arm64 = 0xAA64 }['${{ matrix.architecture }}']
+          foreach ($binary in $actual | Where-Object { $_ -match '\.(exe|dll)$' }) {
+            $bytes = [IO.File]::ReadAllBytes((Join-Path $root $binary))
+            $peOffset = [BitConverter]::ToInt32($bytes, 0x3C)
+            $machine = [BitConverter]::ToUInt16($bytes, $peOffset + 4)
+            if ($machine -ne $expectedMachine) {
+              throw ('{0} targets machine 0x{1:X4}, expected 0x{2:X4}' -f
+                $binary, $machine, $expectedMachine)
+            }
           }
 
           & smoke/bin/xcross.exe --help | Out-Null
@@ -192,14 +337,14 @@ jobs:
         # v4.1.1
         uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373
         with:
-          subject-path: xcross-windows-x64.zip
+          subject-path: ${{ matrix.asset }}.zip
 
       - name: Upload Windows artifact
         # v7
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
-          name: xcross-windows-x64
-          path: xcross-windows-x64.zip
+          name: ${{ matrix.asset }}
+          path: ${{ matrix.asset }}.zip
           if-no-files-found: error
 
   release:
@@ -238,7 +383,8 @@ jobs:
           for asset in \
             xcross-linux-x64.tar.gz \
             xcross-linux-arm64.tar.gz \
-            xcross-windows-x64.zip; do
+            xcross-windows-x64.zip \
+            xcross-windows-arm64.zip; do
             echo "==> verifying $asset"
             gh attestation verify "dist/$asset" \
               --repo "$GITHUB_REPOSITORY" \
@@ -255,7 +401,8 @@ jobs:
           sha256sum \
             xcross-linux-x64.tar.gz \
             xcross-linux-arm64.tar.gz \
-            xcross-windows-x64.zip >SHA256SUMS.txt
+            xcross-windows-x64.zip \
+            xcross-windows-arm64.zip >SHA256SUMS.txt
           cat SHA256SUMS.txt
 
       - name: Create and publish release
@@ -285,6 +432,7 @@ jobs:
             dist/xcross-linux-x64.tar.gz \
             dist/xcross-linux-arm64.tar.gz \
             dist/xcross-windows-x64.zip \
+            dist/xcross-windows-arm64.zip \
             dist/SHA256SUMS.txt \
             packages/apple_developer_kit/ADI_LICENSE \
             --title "$tag" \

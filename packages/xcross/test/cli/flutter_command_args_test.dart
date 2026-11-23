@@ -4,12 +4,69 @@
 // `Command.argParser` seam from package:args — no private state.
 import 'package:args/command_runner.dart';
 import 'package:test/test.dart';
-import 'package:xcross/src/cli/basic/auth_command.dart';
-import 'package:xcross/src/cli/flutter/subcommands/flutter_build_command.dart';
-import 'package:xcross/src/cli/flutter/subcommands/flutter_run_command.dart';
-import 'package:xcross/src/cli/runner.dart';
+import 'package:xcross/src/composition/cli/flutter_build_command.dart';
+import 'package:xcross/src/composition/cli/flutter_run_command.dart';
+import 'package:xcross/src/composition/cli/runner.dart';
+import 'package:xcross/src/shared/cli/basic/auth_command.dart';
+import 'package:xcross/src/shared/errors/build_error.dart';
+import 'package:xcross/src/shared/errors/errors.dart';
+import 'package:xcross/src/shared/flutter/models/flutter/flutter_build_mode.dart';
+import 'package:xcross/src/shared/flutter/models/flutter/flutter_build_options.dart';
+import 'package:xcross/src/shared/models/pack_result.dart';
+import 'package:xcross/src/target/iphone/device/core_device_launch_profile.dart';
+
+import '../log_fixture.dart';
+import 'runtime_fixture.dart';
 
 void main() {
+  group('flutterBuildModeOf', () {
+    Never usage(String message) => throw UsageException(message, '');
+    FlutterBuildMode modeOf({
+      bool debug = false,
+      bool profile = false,
+      bool release = false,
+    }) => flutterBuildModeOf(
+      debug: debug,
+      profile: profile,
+      release: release,
+      usageException: usage,
+    );
+
+    test('defaults to debug when no mode flag is given', () {
+      expect(modeOf(), FlutterBuildMode.debug);
+    });
+
+    test('selects the single given mode', () {
+      expect(modeOf(debug: true), FlutterBuildMode.debug);
+      expect(modeOf(profile: true), FlutterBuildMode.profile);
+      expect(modeOf(release: true), FlutterBuildMode.release);
+    });
+
+    test('rejects several mode flags', () {
+      for (final flags in [
+        (debug: true, profile: true, release: false),
+        (debug: true, profile: false, release: true),
+        (debug: false, profile: true, release: true),
+        (debug: true, profile: true, release: true),
+      ]) {
+        expect(
+          () => modeOf(
+            debug: flags.debug,
+            profile: flags.profile,
+            release: flags.release,
+          ),
+          throwsA(
+            isA<UsageException>().having(
+              (e) => e.message,
+              'message',
+              'Choose only one of --debug, --profile or --release.',
+            ),
+          ),
+        );
+      }
+    });
+  });
+
   group('FlutterRunCommand.shouldUseCoreDevice', () {
     test('uses CoreDevice for confirmed iOS 17+ and unknown devices', () {
       expect(FlutterRunCommand.shouldUseCoreDevice(17), isTrue);
@@ -24,7 +81,14 @@ void main() {
   group('FlutterRunCommand', () {
     late Command<void> command;
 
-    setUp(() => command = FlutterRunCommand());
+    setUp(() {
+      final application = testApplication();
+      command = FlutterRunCommand(
+        application.runtime,
+        application.pymd,
+        sockets: application.sockets,
+      );
+    });
 
     test(
       'defaults: usb/wifi off, device-connection both, target/pub inherited',
@@ -93,10 +157,142 @@ void main() {
     });
   });
 
+  group('FlutterRunCommand precompiled launch', () {
+    late List<FlutterBuildOptions> packed;
+    late List<CoreDeviceLaunchProfile> launched;
+
+    Future<void> run(
+      List<String> args, {
+      Map<String, String> environment = const {},
+    }) {
+      final application = testApplication(environment: environment);
+      final runner = CommandRunner<void>('xcross', 'test')
+        ..addCommand(
+          FlutterRunCommand.withSeams(
+            application.runtime,
+            application.pymd,
+            sockets: application.sockets,
+            pack: (options) async {
+              packed.add(options);
+              return const PackResult(
+                outputPath: 'build/Runner.app',
+                bundleId: 'dev.example.app',
+              );
+            },
+            runDevice:
+                ({
+                  required pack,
+                  required selector,
+                  required mode,
+                  required launchProfile,
+                }) async => launched.add(launchProfile),
+          ),
+        );
+      return runner.run(['run', ...args]);
+    }
+
+    setUp(() {
+      packed = [];
+      launched = [];
+    });
+
+    test('profile builds AOT and launches with the VM Service', () async {
+      await run(['--profile', '--route=/home']);
+
+      expect(packed.single.buildMode, FlutterBuildMode.profile);
+      final profile = launched.single;
+      expect(profile.buildMode, FlutterBuildMode.profile);
+      expect(profile.hotReload, isNull);
+      expect(profile.debuggingEnabled, isTrue);
+      expect(
+        profile.argumentsForLaunch(
+          isDap: false,
+          vmServiceBindAddress: '0.0.0.0',
+        ),
+        containsAll([
+          '--vm-service-host=0.0.0.0',
+          '--enable-dart-profiling',
+          '--route=/home',
+        ]),
+      );
+    });
+
+    test('release builds AOT and launches without debugging', () async {
+      await run(['--release']);
+
+      expect(packed.single.buildMode, FlutterBuildMode.release);
+      final profile = launched.single;
+      expect(profile.buildMode, FlutterBuildMode.release);
+      expect(profile.hotReload, isNull);
+      expect(profile.debuggingEnabled, isFalse);
+      expect(
+        profile.argumentsForLaunch(isDap: false, vmServiceBindAddress: '::0'),
+        isEmpty,
+      );
+    });
+
+    for (final mode in [
+      ('--profile', FlutterBuildMode.profile, true),
+      ('--release', FlutterBuildMode.release, false),
+    ]) {
+      test('DAP accepts a ${mode.$1} launch', () async {
+        await run([mode.$1], environment: const {'XCROSS_DAP': '1'});
+
+        final profile = launched.single;
+        expect(profile.buildMode, mode.$2);
+        expect(profile.hotReload, isNull);
+        expect(profile.debuggingEnabled, mode.$3);
+      });
+    }
+  });
+
   group('FlutterBuildCommand', () {
+    test('accepts explicit simulator debug and preserves device default', () {
+      final command = FlutterBuildCommand(testRuntime());
+      expect(command.argParser.parse([]).option('target-platform'), 'iphone');
+      final results = command.argParser.parse([
+        '--target-platform',
+        'simulator',
+        '--debug',
+      ]);
+      expect(results.option('target-platform'), 'simulator');
+      expect(results.flag('debug'), isTrue);
+    });
+
+    for (final flags in [
+      ['--target-platform', 'simulator', '--ipa'],
+      ['--target-platform', 'simulator', '--profile'],
+      ['--target-platform', 'simulator', '--release'],
+      ['--debug', '--profile'],
+    ]) {
+      test(
+        'rejects unsupported combination $flags before accessing a project',
+        () async {
+          final runner = CommandRunner<void>('test', 'test')
+            ..addCommand(FlutterBuildCommand(testRuntime()));
+          await expectLater(
+            runner.run(['build', ...flags]),
+            throwsA(switch (flags) {
+              _ when flags.contains('--ipa') => isA<XcrossError>(),
+              _ when flags.contains('simulator') =>
+                isA<XcrossBuildError>().having(
+                  (e) => e.message,
+                  'message',
+                  startsWith(
+                    '${flags.last == '--release' ? 'Release' : 'Profile'} '
+                    'mode is not supported for simulators.',
+                  ),
+                ),
+              _ => isA<UsageException>(),
+            }),
+          );
+        },
+      );
+    }
+
     late Command<void> command;
 
-    setUp(() => command = FlutterBuildCommand());
+    setUp(() => command = FlutterBuildCommand(testRuntime()));
 
     test('defaults: target/pub inherited, ipa off', () {
       final results = command.argParser.parse([]);
@@ -157,9 +353,18 @@ void main() {
   group('AuthCommand', () {
     late Command<void> command;
 
-    setUp(() => command = AuthCommand());
+    setUp(
+      () => command = AuthCommand(
+        commandPrompt: TestCommandPrompt(),
+        log: testLog(),
+        hostServices: testRuntime().appleHostServices,
+        createHttpClient: testRuntime().createAppleHttpClient,
+        createAdiHttpClient: testRuntime().createHttpClient,
+        createNativeLibraryLoader: testRuntime().createNativeLibraryLoader,
+      ),
+    );
 
-    test('exposes all six option names', () {
+    test('exposes all seven option names', () {
       final options = command.argParser.options;
       expect(
         options.keys,
@@ -170,6 +375,7 @@ void main() {
           'apple-id',
           'password',
           'adi-library-dir',
+          'anisette-url',
         ]),
       );
     });
@@ -185,16 +391,18 @@ void main() {
 
   group('XcrossCli global -v', () {
     test('-v sets the verbose flag on the runner', () {
-      final results = XcrossCli.buildRunner().argParser.parse(['-v']);
+      final results = XcrossCli.buildRunner(
+        testApplication(),
+        configTerminal: TestTerminal(),
+      ).argParser.parse(['-v']);
       expect(results.flag('verbose'), isTrue);
     });
 
     test('verbose is accepted after the flutter build command', () {
-      final results = XcrossCli.buildRunner().argParser.parse([
-        'flutter',
-        'build',
-        '--verbose',
-      ]);
+      final results = XcrossCli.buildRunner(
+        testApplication(),
+        configTerminal: TestTerminal(),
+      ).argParser.parse(['flutter', 'build', '--verbose']);
       expect(results.flag('verbose'), isTrue);
       expect(results.command!.name, 'flutter');
       expect(results.command!.command!.name, 'build');

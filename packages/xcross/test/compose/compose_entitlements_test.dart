@@ -1,10 +1,20 @@
+@TestOn('!windows')
+library;
+
 import 'dart:io';
 
 import 'package:path/path.dart' as p;
 import 'package:test/test.dart';
-import 'package:xcross/src/compose/build/compose_entitlements.dart';
+import 'package:xcross/src/shared/compose/build/compose_entitlements.dart';
+
+import 'support/compose_platforms.dart';
 
 void main() {
+  late ComposeTestSession session;
+  setUp(() {
+    session = createComposeTestSession();
+  });
+  tearDown(() => session.dispose());
   late Directory root;
 
   setUp(() {
@@ -44,7 +54,7 @@ void main() {
       write(p.join('iosApp', 'Other.entitlements'), entitlements({}));
 
       expect(
-        ComposeEntitlements.find(
+        ComposeEntitlements(session.fixtureRunner.host.fileSystem).find(
           root.path,
           'Example',
           appDir: p.join(root.path, 'app', 'iosApp'),
@@ -59,7 +69,12 @@ void main() {
         entitlements({}),
       );
 
-      expect(ComposeEntitlements.find(root.path, 'Example'), wanted);
+      expect(
+        ComposeEntitlements(
+          session.fixtureRunner.host.fileSystem,
+        ).find(root.path, 'Example'),
+        wanted,
+      );
     });
 
     test('falls back to the iosApp layout', () {
@@ -68,7 +83,12 @@ void main() {
         entitlements({}),
       );
 
-      expect(ComposeEntitlements.find(root.path, 'Example'), wanted);
+      expect(
+        ComposeEntitlements(
+          session.fixtureRunner.host.fileSystem,
+        ).find(root.path, 'Example'),
+        wanted,
+      );
     });
 
     test('finds an app kept outside the conventional layouts', () {
@@ -77,7 +97,12 @@ void main() {
         entitlements({}),
       );
 
-      expect(ComposeEntitlements.find(root.path, 'Example'), wanted);
+      expect(
+        ComposeEntitlements(
+          session.fixtureRunner.host.fileSystem,
+        ).find(root.path, 'Example'),
+        wanted,
+      );
     });
 
     test('prefers the file named after the app', () {
@@ -87,7 +112,12 @@ void main() {
         entitlements({}),
       );
 
-      expect(ComposeEntitlements.find(root.path, 'Example'), wanted);
+      expect(
+        ComposeEntitlements(
+          session.fixtureRunner.host.fileSystem,
+        ).find(root.path, 'Example'),
+        wanted,
+      );
     });
 
     // Guessing would enable capabilities on an App ID for a target that never
@@ -96,18 +126,33 @@ void main() {
       write(p.join('one', 'A.entitlements'), entitlements({}));
       write(p.join('two', 'B.entitlements'), entitlements({}));
 
-      expect(ComposeEntitlements.find(root.path, 'Example'), isNull);
+      expect(
+        ComposeEntitlements(
+          session.fixtureRunner.host.fileSystem,
+        ).find(root.path, 'Example'),
+        isNull,
+      );
     });
 
     test('ignores build output and dependency checkouts', () {
       write(p.join('build', 'bin', 'Copy.entitlements'), entitlements({}));
       write(p.join('Pods', 'Other.entitlements'), entitlements({}));
 
-      expect(ComposeEntitlements.find(root.path, 'Example'), isNull);
+      expect(
+        ComposeEntitlements(
+          session.fixtureRunner.host.fileSystem,
+        ).find(root.path, 'Example'),
+        isNull,
+      );
     });
 
     test('returns null when the project has none', () {
-      expect(ComposeEntitlements.find(root.path, 'Example'), isNull);
+      expect(
+        ComposeEntitlements(
+          session.fixtureRunner.host.fileSystem,
+        ).find(root.path, 'Example'),
+        isNull,
+      );
     });
   });
 
@@ -123,10 +168,15 @@ void main() {
         }),
       );
 
-      expect(ComposeEntitlements.read(root.path, 'Example'), {
-        'com.apple.developer.applesignin': ['Default'],
-        'aps-environment': 'development',
-      });
+      expect(
+        ComposeEntitlements(
+          session.fixtureRunner.host.fileSystem,
+        ).read(root.path, 'Example'),
+        {
+          'com.apple.developer.applesignin': ['Default'],
+          'aps-environment': 'development',
+        },
+      );
     });
 
     // These values only ever add capabilities to the profile, so a file Xcode
@@ -135,7 +185,12 @@ void main() {
     test('treats a malformed entitlements file as none', () {
       write(p.join('iosApp', 'Example.entitlements'), 'not a plist at all');
 
-      expect(ComposeEntitlements.read(root.path, 'Example'), isNull);
+      expect(
+        ComposeEntitlements(
+          session.fixtureRunner.host.fileSystem,
+        ).read(root.path, 'Example'),
+        isNull,
+      );
     });
 
     test('treats a non-dictionary root as none', () {
@@ -149,11 +204,21 @@ void main() {
         '</plist>\n',
       );
 
-      expect(ComposeEntitlements.read(root.path, 'Example'), isNull);
+      expect(
+        ComposeEntitlements(
+          session.fixtureRunner.host.fileSystem,
+        ).read(root.path, 'Example'),
+        isNull,
+      );
     });
 
     test('returns null when there is nothing to read', () {
-      expect(ComposeEntitlements.read(root.path, 'Example'), isNull);
+      expect(
+        ComposeEntitlements(
+          session.fixtureRunner.host.fileSystem,
+        ).read(root.path, 'Example'),
+        isNull,
+      );
     });
   });
 }

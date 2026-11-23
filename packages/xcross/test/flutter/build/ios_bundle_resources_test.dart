@@ -1,9 +1,17 @@
+@TestOn('!windows')
+library;
+
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:path/path.dart' as p;
 import 'package:test/test.dart';
-import 'package:xcross/src/flutter/build/ios_bundle_resources.dart';
-import 'package:xcross/src/flutter/build/pbxproj.dart';
+import 'package:xcross/src/shared/flutter/build/ios_bundle_resources.dart';
+import 'package:xcross/src/shared/flutter/project/pbx_project_reader.dart';
+import 'package:xcross/src/shared/swiftpm/recursive_directory_copy.dart';
+
+import '../../host_operations_fixtures.dart';
+import '../flutter_test_runtime.dart';
 
 void main() {
   late Directory tmp;
@@ -56,6 +64,60 @@ void main() {
     expect(
       Directory(p.join(bundle.path, 'Assets.xcassets')).existsSync(),
       isFalse,
+    );
+  });
+
+  test('reads the app icon name from the build configuration', () async {
+    _writeProject(project, appRefs: const [], flavorAppIcon: 'AppIcon-prod');
+
+    final debug = await _stage(project, bundle);
+    expect(debug.appIconName, 'AppIcon');
+    expect(debug.deviceFamily, [1, 2]);
+    expect(debug.alternateAppIconNames, ['AppIconRed', 'AppIconBlue']);
+    expect(debug.accentColorName, 'AccentColor');
+    expect(debug.includeAllAppIcons, isFalse);
+    expect(
+      (await _stage(
+        project,
+        bundle,
+        configuration: 'Release-prod',
+      )).appIconName,
+      'AppIcon-prod',
+    );
+  });
+
+  test(
+    'hands asset catalogs and uncompiled storyboards to the compiler',
+    () async {
+      _file(runner, 'Assets.xcassets/Contents.json', '{}');
+      _file(runner, 'Base.lproj/Main.storyboard', 'source');
+      _writeProject(project, appRefs: ['ASSETS', 'STORYBOARD']);
+
+      final staged = await _stage(project, bundle);
+
+      expect(staged.assetCatalogs, [p.join(runner.path, 'Assets.xcassets')]);
+      expect(staged.storyboards, [
+        p.join(runner.path, 'Base.lproj', 'Main.storyboard'),
+      ]);
+      expect(
+        staged.storyboard('Main', p.context),
+        p.join(runner.path, 'Base.lproj', 'Main.storyboard'),
+      );
+      expect(staged.storyboard('LaunchScreen', p.context), isNull);
+      expect(Directory(bundle.path).listSync(), isEmpty);
+    },
+  );
+
+  test('falls back to the Flutter template layout without a project', () async {
+    _file(runner, 'Assets.xcassets/Contents.json', '{}');
+    _file(runner, 'Base.lproj/LaunchScreen.storyboard', 'source');
+
+    final staged = await _stage(project, bundle);
+
+    expect(staged.assetCatalogs, [p.join(runner.path, 'Assets.xcassets')]);
+    expect(
+      staged.storyboard('LaunchScreen', p.context),
+      p.join(runner.path, 'Base.lproj', 'LaunchScreen.storyboard'),
     );
   });
 
@@ -118,7 +180,7 @@ void main() {
     ).writeAsStringSync('{ malformed');
 
     expect(
-      PbxProject.findPbxproj(project.path),
+      testIPhoneRuntime().projects.findPbxproj(project.path),
       endsWith(p.join('Custom.xcodeproj', 'project.pbxproj')),
     );
   });
@@ -132,7 +194,7 @@ void main() {
     _writeProject(project, appRefs: [], projectName: 'Custom');
 
     expect(
-      PbxProject.findPbxproj(project.path),
+      testIPhoneRuntime().projects.findPbxproj(project.path),
       endsWith(p.join('Custom.xcodeproj', 'project.pbxproj')),
     );
   });
@@ -152,7 +214,7 @@ void main() {
     );
 
     expect(
-      PbxProject.findPbxproj(project.path),
+      testIPhoneRuntime().projects.findPbxproj(project.path),
       endsWith(p.join('Alpha.xcodeproj', 'project.pbxproj')),
     );
   });
@@ -187,15 +249,19 @@ void main() {
     () async {
       _file(runner, 'Info.plist', 'info');
       _file(runner, 'Settings.plist', 'settings');
-      _file(project, 'ios/Flutter/AppFrameworkInfo.plist', 'framework input');
+      _file(project, 'ios/Flutter/AppFrameworkInfo.plist', _appFrameworkInfo);
       _writeProject(project, appRefs: ['INFO', 'SETTINGS', 'FRAMEWORK_INFO']);
 
       await _stage(project, bundle);
 
       expect(_bundleFile(bundle, 'Info.plist').existsSync(), isFalse);
+      // Xcode 26.6 ships it at the app root as a binary plist; these are
+      // the native Runner.app/AppFrameworkInfo.plist's bytes.
       expect(
-        _bundleFile(bundle, 'AppFrameworkInfo.plist').existsSync(),
-        isFalse,
+        base64.encode(
+          _bundleFile(bundle, 'AppFrameworkInfo.plist').readAsBytesSync(),
+        ),
+        _nativeAppFrameworkInfoBinary,
       );
       expect(
         _bundleFile(bundle, 'Settings.plist').readAsStringSync(),
@@ -203,10 +269,136 @@ void main() {
       );
     },
   );
+  test(
+    'resource classification and destinations use selected mapped filesystem',
+    () async {
+      final fileSystem = FixtureMappedFileSystem(tmp);
+      final paths = p.Context(style: p.Style.posix);
+      final copier = RecursiveDirectoryCopier(
+        fileSystem: fileSystem,
+        paths: paths,
+      );
+      const root = '/selected-resource-project';
+      const source = '/selected-resource-input';
+      const destination = '/selected-resource-bundle.app';
+      fileSystem.file('$source/Settings.plist')
+        ..createSync(recursive: true)
+        ..writeAsStringSync('selected resource');
+      fileSystem.file('$source/Payload/nested/value.txt')
+        ..createSync(recursive: true)
+        ..writeAsStringSync('selected directory');
+      fileSystem.file('$root/ios/Runner.xcodeproj/project.pbxproj')
+        ..createSync(recursive: true)
+        ..writeAsStringSync('''
+{
+ rootObject = PROJECT;
+ objects = {
+ PROJECT = { isa = PBXProject; };
+ APP = { isa = PBXNativeTarget; productType = com.apple.product-type.application; buildPhases = (RESOURCES); };
+ RESOURCES = { isa = PBXResourcesBuildPhase; files = (SETTINGS_BUILD, PAYLOAD_BUILD); };
+ SETTINGS_BUILD = { isa = PBXBuildFile; fileRef = SETTINGS; };
+ PAYLOAD_BUILD = { isa = PBXBuildFile; fileRef = PAYLOAD; };
+ SETTINGS = { isa = PBXFileReference; path = /selected-resource-input/Settings.plist; sourceTree = "<absolute>"; };
+ PAYLOAD = { isa = PBXFileReference; path = /selected-resource-input/Payload; sourceTree = "<absolute>"; };
+ }
+}
+''');
+      final resources = IosBundleResources(
+        fileSystem,
+        paths,
+        PbxProjectReader(fileSystem, paths),
+        copier: copier,
+      );
+      fileSystem.touched.clear();
+      await resources.stage(projectRoot: root, bundleDir: destination);
+      expect(
+        fileSystem.file('$destination/Settings.plist').readAsStringSync(),
+        'selected resource',
+      );
+      expect(
+        fileSystem
+            .file('$destination/Payload/nested/value.txt')
+            .readAsStringSync(),
+        'selected directory',
+      );
+      expect(fileSystem.touched, contains('$source/Settings.plist'));
+      expect(fileSystem.touched, contains('$source/Payload'));
+      expect(fileSystem.touched, contains('$destination/Settings.plist'));
+      expect(
+        fileSystem.touched,
+        contains('$destination/Payload/nested/value.txt'),
+      );
+      expect(File('$destination/Settings.plist').existsSync(), isFalse);
+    },
+  );
+
+  test(
+    'project discovery and synchronized walks return logical mapped paths',
+    () async {
+      final fileSystem = FixtureMappedFileSystem(tmp);
+      final paths = p.Context(style: p.Style.posix);
+      const root = '/mapped-project';
+      void write(String path, String contents) => fileSystem.file(path)
+        ..createSync(recursive: true)
+        ..writeAsStringSync(contents);
+      write('$root/ios/Runner/Payload/value.txt', 'synchronized');
+      write('$root/ios/Runner/Excluded.txt', 'excluded');
+      write('$root/ios/Runner/Moved/Relocated.plist', 'relocated');
+      write('$root/ios/App.xcodeproj/project.pbxproj', '''
+{
+ rootObject = PROJECT;
+ objects = {
+ PROJECT = { isa = PBXProject; };
+ APP = { isa = PBXNativeTarget; productType = com.apple.product-type.application; buildPhases = (RESOURCES); fileSystemSynchronizedGroups = (SYNC); };
+ RESOURCES = { isa = PBXResourcesBuildPhase; files = (RELOCATED_BUILD); };
+ RELOCATED_BUILD = { isa = PBXBuildFile; fileRef = RELOCATED; };
+ RELOCATED = { isa = PBXFileReference; path = Runner/Relocated.plist; sourceTree = SOURCE_ROOT; };
+ SYNC = { isa = PBXFileSystemSynchronizedRootGroup; path = Runner; sourceTree = SOURCE_ROOT; exceptions = (EXCEPTIONS); };
+ EXCEPTIONS = { isa = PBXFileSystemSynchronizedBuildFileExceptionSet; target = APP; membershipExceptions = (Excluded.txt, Moved/Relocated.plist); };
+ }
+}
+''');
+      final reader = PbxProjectReader(fileSystem, paths);
+      final pbxproj = reader.findPbxproj(root);
+      expect(pbxproj, '$root/ios/App.xcodeproj/project.pbxproj');
+      final project = reader.parseFile(pbxproj!)!;
+      expect(
+        project.synchronizedFiles(
+          project.applicationTarget!,
+          fileSystem: fileSystem,
+        ),
+        ['$root/ios/Runner/Payload/value.txt'],
+      );
+
+      const bundle = '/mapped-bundle.app';
+      await IosBundleResources(
+        fileSystem,
+        paths,
+        reader,
+        copier: RecursiveDirectoryCopier(fileSystem: fileSystem, paths: paths),
+      ).stage(projectRoot: root, bundleDir: bundle);
+      expect(
+        fileSystem.file('$bundle/value.txt').readAsStringSync(),
+        'synchronized',
+      );
+      expect(
+        fileSystem.file('$bundle/Relocated.plist').readAsStringSync(),
+        'relocated',
+      );
+      expect(fileSystem.file('$bundle/Excluded.txt').existsSync(), isFalse);
+    },
+  );
 }
 
-Future<void> _stage(Directory project, Directory bundle) =>
-    stageIosBundleResources(projectRoot: project.path, bundleDir: bundle.path);
+Future<StagedIosResources> _stage(
+  Directory project,
+  Directory bundle, {
+  String configuration = 'Debug',
+}) => testIPhoneRuntime().resources.stage(
+  projectRoot: project.path,
+  bundleDir: bundle.path,
+  configuration: configuration,
+);
 
 File _bundleFile(Directory bundle, String relative) =>
     File(p.join(bundle.path, relative));
@@ -224,6 +416,7 @@ void _writeProject(
   bool synchronized = false,
   List<String> exceptions = const [],
   String productType = 'com.apple.product-type.application',
+  String flavorAppIcon = '',
 }) {
   final xcodeproj = Directory(
     p.join(project.path, 'ios', '$projectName.xcodeproj'),
@@ -258,8 +451,9 @@ void _writeProject(
     VARIANT = { isa = PBXVariantGroup; path = Labels.strings; children = (BASE_LABELS, FR_LABELS); };
     BASE_LABELS = { isa = PBXFileReference; path = Base.lproj/Labels.strings; sourceTree = "<group>"; };
     FR_LABELS = { isa = PBXFileReference; path = fr.lproj/Labels.strings; sourceTree = "<group>"; };
-    APP_CONFIG_LIST = { isa = XCConfigurationList; buildConfigurations = (APP_CONFIG); };
-    APP_CONFIG = { isa = XCBuildConfiguration; name = Debug; buildSettings = { INFOPLIST_FILE = Runner/Info.plist; }; };
+    APP_CONFIG_LIST = { isa = XCConfigurationList; buildConfigurations = (APP_CONFIG${flavorAppIcon.isEmpty ? '' : ', PROD_CONFIG'}); };
+    APP_CONFIG = { isa = XCBuildConfiguration; name = Debug; buildSettings = { INFOPLIST_FILE = Runner/Info.plist; ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon; TARGETED_DEVICE_FAMILY = "1,2"; ASSETCATALOG_COMPILER_ALTERNATE_APPICON_NAMES = "AppIconRed AppIconBlue"; ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor; }; };
+    ${flavorAppIcon.isEmpty ? '' : 'PROD_CONFIG = { isa = XCBuildConfiguration; name = Release-prod; buildSettings = { INFOPLIST_FILE = Runner/Info.plist; ASSETCATALOG_COMPILER_APPICON_NAME = $flavorAppIcon; }; };'}
     APP_TARGET = { isa = PBXNativeTarget; productType = $productType; buildConfigurationList = APP_CONFIG_LIST; buildPhases = (APP_RESOURCES); ${synchronized ? 'fileSystemSynchronizedGroups = (SYNC_GROUP);' : ''} };
     ${synchronized ? 'SYNC_GROUP = { isa = PBXFileSystemSynchronizedRootGroup; path = Runner; sourceTree = SOURCE_ROOT; exceptions = (SYNC_EXCEPTIONS); };\n    SYNC_EXCEPTIONS = { isa = PBXFileSystemSynchronizedBuildFileExceptionSet; target = APP_TARGET; membershipExceptions = (${exceptions.join(', ')}); };' : ''}
     APP_RESOURCES = { isa = PBXResourcesBuildPhase; files = (
@@ -285,3 +479,34 @@ void _writeProject(
 ''');
   File(p.join(xcodeproj.path, 'project.pbxproj')).writeAsStringSync('$objects');
 }
+
+/// Flutter 3.47's template ios/Flutter/AppFrameworkInfo.plist.
+const _appFrameworkInfo = '''
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleDevelopmentRegion</key>
+  <string>en</string>
+  <key>CFBundleExecutable</key>
+  <string>App</string>
+  <key>CFBundleIdentifier</key>
+  <string>io.flutter.flutter.app</string>
+  <key>CFBundleInfoDictionaryVersion</key>
+  <string>6.0</string>
+  <key>CFBundleName</key>
+  <string>App</string>
+  <key>CFBundlePackageType</key>
+  <string>FMWK</string>
+  <key>CFBundleShortVersionString</key>
+  <string>1.0</string>
+  <key>CFBundleSignature</key>
+  <string>????</string>
+  <key>CFBundleVersion</key>
+  <string>1.0</string>
+</dict>
+</plist>
+''';
+
+const _nativeAppFrameworkInfoBinary =
+    'YnBsaXN0MDDZAQIDBAUGBwgJCgsMDQsODxAPXxAZQ0ZCdW5kbGVEZXZlbG9wbWVudFJlZ2lvbl8QEkNGQnVuZGxlRXhlY3V0YWJsZV8QEkNGQnVuZGxlSWRlbnRpZmllcl8QHUNGQnVuZGxlSW5mb0RpY3Rpb25hcnlWZXJzaW9uXENGQnVuZGxlTmFtZV8QE0NGQnVuZGxlUGFja2FnZVR5cGVfEBpDRkJ1bmRsZVNob3J0VmVyc2lvblN0cmluZ18QEUNGQnVuZGxlU2lnbmF0dXJlXxAPQ0ZCdW5kbGVWZXJzaW9uUmVuU0FwcF8QFmlvLmZsdXR0ZXIuZmx1dHRlci5hcHBTNi4wVEZNV0tTMS4wVD8/Pz8ACAAbADcATABhAIEAjgCkAMEA1QDnAOoA7gEHAQsBEAEUAAAAAAAAAgEAAAAAAAAAEQAAAAAAAAAAAAAAAAAAARk=';

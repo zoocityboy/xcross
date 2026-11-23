@@ -1,0 +1,290 @@
+import 'package:cli_kit/shared/platform/platform_host.dart';
+import 'package:meta/meta.dart';
+import 'package:path/path.dart' as p;
+import 'package:xcross/src/shared/flutter/build/flutter_aot_snapshotter.dart';
+import 'package:xcross/src/shared/flutter/build/icon_tree_shaker.dart';
+import 'package:xcross/src/shared/flutter/build/impeller_shader_compiler.dart';
+import 'package:xcross/src/shared/flutter/build/internal/toolchain.dart';
+import 'package:xcross/src/shared/flutter/build/ios_engine_cache.dart';
+import 'package:xcross/src/shared/flutter/constants.dart';
+import 'package:xcross/src/shared/flutter/errors.dart';
+import 'package:xcross/src/shared/flutter/flutter_assets_compiler.dart';
+import 'package:xcross/src/shared/flutter/flutter_build_runtime.dart';
+import 'package:xcross/src/shared/flutter/flutter_kernel_compiler.dart';
+import 'package:xcross/src/shared/swiftpm/ios_deployment_target.dart';
+
+/// Assembles `App.framework` (debug/JIT mode) for a Flutter iOS app without
+/// invoking `xcrun` or `flutter_tools.snapshot assemble`.
+///
+/// Cross-platform path for hosts where `xcrun` is unavailable.
+///
+/// Pipeline:
+///   1. Download iOS engine artifacts via [IosEngineCache] if missing.
+///   2. Run `frontend_server` → `app.dill` (Dart kernel for JIT).
+///   3. Bundle `flutter_assets/` (kernel blob, snapshot data, manifests).
+///   4. Build App stub Mach-O dylib via clang + ld64.lld from PATH.
+///   5. Write `App.framework/Info.plist`.
+///
+@internal
+final class FlutterDebugBundler<T extends PlatformHostInterface> {
+  FlutterDebugBundler({
+    required this.runtime,
+    required this.kernel,
+    required this.assets,
+    required this.projectRoot,
+    required this.flutterRoot,
+    required this.outputDir,
+    required this.deploymentTarget,
+    this.entrypoint = 'lib/main.dart',
+    this.treeShakeIcons = false,
+    this.snapshotter,
+    this.splitDebugInfo,
+    this.obfuscate = false,
+  });
+  final FlutterBuildRuntime<T> runtime;
+  final FlutterKernelCompiler<T> kernel;
+  final FlutterAssetsCompiler assets;
+  final String projectRoot;
+  final String flutterRoot;
+  final String outputDir;
+  final IosDeploymentTarget deploymentTarget;
+
+  /// Dart entrypoint to compile (default: `lib/main.dart`).
+  final String entrypoint;
+
+  /// Whether icon fonts are subset to the glyphs the app uses.
+  final bool treeShakeIcons;
+
+  /// Creates the compiler of the kernel to native code for profile and
+  /// release builds; `null` builds the debug (JIT) framework.
+  final FlutterAotSnapshotterFactory<T>? snapshotter;
+
+  /// `--split-debug-info` directory for AOT builds.
+  final String? splitDebugInfo;
+
+  /// `--obfuscate` for AOT builds.
+  final bool obfuscate;
+
+  bool get _precompiled => snapshotter != null;
+  Future<String> build() async {
+    final engineCache = runtime.engineCache(
+      flutterRoot,
+      mode: kernel.buildMode,
+    );
+    await runtime.runner.log.logStep(
+      'Fetching Flutter engine artifacts',
+      engineCache.ensureArtifactsAvailable,
+    );
+
+    final aot = await snapshotter?.call(engineCache);
+    runtime.runner.log.logTrace('resolving iOS debug toolchain');
+    final toolchain = _precompiled ? null : await _resolveToolchain();
+
+    runtime.runner.log.logTrace('preparing App.framework output');
+    await runtime.host.fileSystem.directory(outputDir).create(recursive: true);
+
+    final appFramework = p.join(outputDir, 'App.framework');
+    final assetsDir = p.join(appFramework, 'flutter_assets');
+
+    final appDir = runtime.host.fileSystem.directory(appFramework);
+    if (appDir.existsSync()) await appDir.delete(recursive: true);
+    await runtime.host.fileSystem.directory(assetsDir).create(recursive: true);
+
+    final appDill = await kernel.compile(engineCache);
+    final pubspec = runtime.pubspecs.loadSync(projectRoot);
+    if (treeShakeIcons) await engineCache.ensureFontSubsetAvailable();
+
+    await runtime.runner.log.logStep(
+      'Bundling assets',
+      () => assets.bundle(
+        assetsDir: assetsDir,
+        appDill: appDill,
+        vmSnapshotData: engineCache.vmSnapshotData,
+        isolateSnapshotData: engineCache.isolateSnapshotData,
+        pubspec: pubspec,
+        shaders: ImpellerShaderCompiler(
+          runner: runtime.runner,
+          impellerc: engineCache.impellerc,
+          shaderLib: engineCache.shaderLib,
+        ),
+        icons: treeShakeIcons
+            ? IconTreeShaker(
+                runner: runtime.runner,
+                dart: engineCache.dart,
+                constFinder: engineCache.constFinder,
+                fontSubset: engineCache.fontSubset,
+              )
+            : null,
+        precompiled: _precompiled,
+      ),
+    );
+
+    if (aot != null) {
+      await aot.compile(
+        appDill: appDill,
+        appFramework: appFramework,
+        objectFile: p.join(outputDir, 'app.o'),
+        splitDebugInfo: splitDebugInfo,
+        obfuscate: obfuscate,
+      );
+    } else {
+      await buildAppStub(appFramework, toolchain!);
+    }
+
+    runtime.runner.log.logTrace('writing App.framework Info.plist');
+    _writeAppFrameworkInfoPlist(
+      appFramework,
+      engineCache.engineMinimumOsVersion ??
+          FlutterAotSnapshotter.fallbackMinimumOsVersion,
+    );
+
+    return appFramework;
+  }
+
+  Future<Toolchain> _resolveToolchain() async {
+    final darwin = runtime.sdkRepository.current();
+    if (darwin == null) {
+      throw FlutterBuildError(
+        'FlutterDebugBundler: no usable toolchain. No Darwin SDK found.\n'
+        'Install with `xcross sdk install <Xcode.xip|Xcode.app>` first.',
+      );
+    }
+    return Toolchain(
+      clang: await runtime.toolchain.resolveDarwinClang(
+        runtime.sdkRepository.iosSdk(darwin, target: deploymentTarget.platform),
+      ),
+      iosSdk: runtime.sdkRepository.iosSdk(
+        darwin,
+        target: deploymentTarget.platform,
+      ),
+      linker: await runtime.toolchain.resolveLd64Lld(),
+    );
+  }
+
+  @visibleForTesting
+  Future<void> buildAppStub(String appFramework, Toolchain toolchain) =>
+      runtime.runner.log.logStep('Building App.framework', () async {
+        final tmp = await runtime.host.fileSystem
+            .directory(runtime.host.paths.temporaryRoot)
+            .createTemp('xcross-flutter-stub-');
+        final stubSource = p.join(tmp.path, 'debug_app.c');
+        // Exact stub content emitted by flutter_tools.
+        await runtime.host.fileSystem
+            .file(stubSource)
+            .writeAsString('static const int Moo = 88;\n');
+
+        await runtime.host.fileSystem
+            .directory(appFramework)
+            .create(recursive: true);
+        final outputBinary = p.join(appFramework, 'App');
+
+        // Flags mirror flutter_tools `_createStubAppFramework`.
+        final args = appStubClangArgs(
+          toolchain: toolchain,
+          stubSource: stubSource,
+          outputBinary: outputBinary,
+          deploymentTarget: deploymentTarget,
+        );
+
+        await runtime.runner.runChecked(
+          toolchain.clang,
+          args,
+          inheritStdio: runtime.runner.log.isVerbose,
+          label: 'clang',
+        );
+
+        final outputBinaryExists = runtime.host.fileSystem
+            .file(outputBinary)
+            .existsSync();
+        if (!outputBinaryExists) {
+          throw FlutterBuildError(
+            'FlutterDebugBundler: clang did not produce $outputBinary',
+          );
+        }
+
+        await tmp.delete(recursive: true);
+      });
+
+  /// Build the clang argument list for the App stub dylib.
+  @visibleForTesting
+  static List<String> appStubClangArgs({
+    required Toolchain toolchain,
+    required String stubSource,
+    required String outputBinary,
+    required IosDeploymentTarget deploymentTarget,
+  }) {
+    return <String>[
+      '-fuse-ld=lld',
+      // By path, not by -B: a bare -B lets clang link with whichever
+      // ld64.lld happens to sit in that directory, and the Swift toolchain
+      // ships one that cannot link Mach-O for iOS.
+      '--ld-path=${toolchain.linker}',
+      '--target=${deploymentTarget.buildTriple}',
+      '-arch',
+      'arm64',
+      deploymentTarget.minimumVersionFlag,
+      '-isysroot',
+      toolchain.iosSdk,
+      '-x',
+      'c',
+      stubSource,
+      '-dynamiclib',
+      '-Xlinker',
+      '-rpath',
+      '-Xlinker',
+      '@executable_path/Frameworks',
+      '-Xlinker',
+      '-rpath',
+      '-Xlinker',
+      '@loader_path/Frameworks',
+      '-fapplication-extension',
+      '-install_name',
+      '@rpath/App.framework/App',
+      '-o',
+      outputBinary,
+    ];
+  }
+
+  void _writeAppFrameworkInfoPlist(String appFramework, String minimumOs) {
+    runtime.host.fileSystem
+        .file(p.join(appFramework, 'Info.plist'))
+        .writeAsStringSync(appFrameworkInfoPlist(minimumOs));
+  }
+
+  /// `App.framework/Info.plist`. flutter_tools (`IosAssetBundle` in
+  /// `build_system/targets/ios.dart`) copies `ios/Flutter/AppFrameworkInfo.plist`
+  /// and sets `MinimumOSVersion` with `plutil -replace` to Flutter's own iOS
+  /// deployment floor (`FlutterDarwinPlatform.ios.deploymentTarget()`), not
+  /// the app's `IPHONEOS_DEPLOYMENT_TARGET`. The engine's `Flutter.framework`
+  /// records that same floor, so [minimumOsVersion] comes from it.
+  @visibleForTesting
+  static String appFrameworkInfoPlist(String minimumOsVersion) {
+    return '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"'
+        ' "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
+        '<plist version="1.0">\n'
+        '<dict>\n'
+        '\t<key>CFBundleDevelopmentRegion</key>\n'
+        '\t<string>en</string>\n'
+        '\t<key>CFBundleExecutable</key>\n'
+        '\t<string>App</string>\n'
+        '\t<key>CFBundleIdentifier</key>\n'
+        '\t<string>io.flutter.flutter.app</string>\n'
+        '\t<key>CFBundleInfoDictionaryVersion</key>\n'
+        '\t<string>6.0</string>\n'
+        '\t<key>CFBundleName</key>\n'
+        '\t<string>App</string>\n'
+        '\t<key>CFBundlePackageType</key>\n'
+        '\t<string>FMWK</string>\n'
+        '\t<key>CFBundleShortVersionString</key>\n'
+        '\t<string>1.0</string>\n'
+        '\t<key>CFBundleSignature</key>\n'
+        '\t<string>????</string>\n'
+        '\t<key>CFBundleVersion</key>\n'
+        '\t<string>1.0</string>\n'
+        '\t<key>${IosDeploymentConstants.minimumOsVersionKey}</key>\n'
+        '\t<string>$minimumOsVersion</string>\n'
+        '</dict>\n'
+        '</plist>\n';
+  }
+}

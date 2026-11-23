@@ -1,7 +1,7 @@
 #!/usr/bin/env sh
 #
-# xcross installer for Linux
-# ==========================
+# xcross installer for Linux (and macOS with --local)
+# ===================================================
 #
 # WHAT THIS DOES
 #   1. Works out which prebuilt release asset matches this machine.
@@ -126,22 +126,31 @@ err() {
 # Step 1 — check that this machine can run a prebuilt release
 # ---------------------------------------------------------------------------
 
-# Only Linux binaries are published.  macOS users build from source; Windows
-# users run install.ps1 instead.
+# Only Linux binaries are published.  macOS users (x64 or arm64) build from
+# source with --local; Windows users run install.ps1 instead.
 os_name="$(uname -s)"
-[ "$os_name" = "Linux" ] ||
-	err "prebuilt releases are Linux-only (got: $os_name); build from source"
-
-# Map the CPU architecture reported by the kernel onto a release asset name.
-# `uname -m` spells the same architecture differently across distros, hence the
-# pairs below.
 cpu_arch="$(uname -m)"
-case "$cpu_arch" in
-x86_64 | amd64) archive_name="xcross-linux-x64.tar.gz" ;;
-aarch64 | arm64) archive_name="xcross-linux-arm64.tar.gz" ;;
-*) err "unsupported architecture: $cpu_arch (supported: x86_64, aarch64)" ;;
-esac
-info "Detected: $os_name/$cpu_arch -> $archive_name"
+if [ "$local_install" = true ]; then
+	# A local build targets whatever host Dart runs on, so no asset mapping.
+	case "$os_name" in
+	Linux | Darwin) ;;
+	*) err "--local supports Linux and macOS (got: $os_name)" ;;
+	esac
+	info "Detected: $os_name/$cpu_arch -> local build"
+else
+	[ "$os_name" = "Linux" ] ||
+		err "prebuilt releases are Linux-only (got: $os_name); build from source with --local"
+
+	# Map the CPU architecture reported by the kernel onto a release asset
+	# name.  `uname -m` spells the same architecture differently across
+	# distros, hence the pairs below.
+	case "$cpu_arch" in
+	x86_64 | amd64) archive_name="xcross-linux-x64.tar.gz" ;;
+	aarch64 | arm64) archive_name="xcross-linux-arm64.tar.gz" ;;
+	*) err "unsupported architecture: $cpu_arch (supported: x86_64, aarch64)" ;;
+	esac
+	info "Detected: $os_name/$cpu_arch -> $archive_name"
+fi
 
 # ---------------------------------------------------------------------------
 # Step 2 — stage a release bundle in a scratch directory
@@ -249,6 +258,14 @@ run_privileged cp -a "$staging_dir/lib/." "$NATIVE_LIB_DIR/"
 
 # 0644: world-readable, non-executable — the right mode for a text notice.
 run_privileged install -m 0644 "$staging_dir/$LICENSE_ASSET" "$installed_license"
+# Release archives also carry notices for the bundled OpenAppleMacrosServer
+# (OpenAppleMacros, swift-syntax and the Swift runtime).
+if [ -d "$staging_dir/THIRD_PARTY_LICENSES" ]; then
+	for notice in "$staging_dir"/THIRD_PARTY_LICENSES/*; do
+		[ -f "$notice" ] || continue
+		run_privileged install -m 0644 "$notice" "$LICENSE_DIR/$(basename "$notice")"
+	done
+fi
 
 # ---------------------------------------------------------------------------
 # Step 5 — verify the installed binary actually runs

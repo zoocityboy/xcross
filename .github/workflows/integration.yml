@@ -1,57 +1,116 @@
 name: Integration Tests
+run-name: >-
+  ${{ github.event_name == 'issue_comment' && startsWith(github.event.comment.body, '/check') &&
+  format('/check #{0}: {1}', github.event.issue.number, github.event.issue.title) ||
+  github.event.pull_request.title || github.event.issue.title || github.event.head_commit.message || github.workflow }}
 
 on:
-  pull_request:
   push:
     branches:
       - main
+  pull_request:
+    types: [opened, reopened]
+  issue_comment:
+    types: [created]
+  workflow_dispatch:
 
 permissions:
   contents: read
 
 env:
-  SWIFT_VERSION: 6.3.3
-  SWIFT_WINDOWS_SHA256: >-
-    235626548F249CD516D3D4D90EEE980DCCAD46F3822DAC1F8E3119B0FEDE94B7
+  FLUTTER_VERSION: 3.47.2
+  SWIFT_VERSION: 6.4.0
+  SWIFT_WINDOWS_X64_SHA256: >-
+    76169A85BCBA82854A0CD8F9655FFB74B3758D60C35A245457510095F2823C03
+  SWIFT_WINDOWS_ARM64_SHA256: >-
+    F48E393634995CB589F547E40D64673BC641CA76B099697BA8227A8904BE4A49
   LLVM_VERSION: 22.1.8
-  LLVM_WINDOWS_SHA256: >-
+  LLVM_WINDOWS_X64_SHA256: >-
     16E5709785FEF73C854646241C4A92C5CD574318D1B33C63330DD7721903E55C
+  LLVM_WINDOWS_ARM64_SHA256: >-
+    76F44EF1BA6EEB5A65904E9500F042F588FADE49952778CE48F0374DAA934396
 
 concurrency:
-  # Keyed by commit so a new push queues alongside in-flight runs
-  # instead of cancelling them.
-  group: integration-${{ github.event_name }}-${{ github.sha }}
+  # Keyed by event and commit so a new push queues alongside in-flight runs
+  # instead of cancelling them; /check comments are keyed by comment.
+  group: integration-${{ github.event_name }}-${{ github.event.comment.id || github.sha }}
   cancel-in-progress: false
 
 jobs:
+  gate:
+    name: Gate
+    if: >-
+      ${{ github.event_name != 'issue_comment' ||
+      (github.event.issue.pull_request &&
+      startsWith(github.event.comment.body, '/check')) }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+      statuses: write
+    outputs:
+      run: ${{ steps.gate.outputs.run }}
+      sha: ${{ steps.gate.outputs.sha }}
+      trusted: ${{ steps.gate.outputs.trusted }}
+      pr: ${{ steps.gate.outputs.pr }}
+    steps:
+      - name: Checkout gate action
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          sparse-checkout: |
+            .github/actions/integration-gate
+            .github/actions/commit-status
+          persist-credentials: false
+
+      - name: Resolve gate
+        id: gate
+        uses: ./.github/actions/integration-gate
+
+      - name: Mark the commit status pending
+        if: steps.gate.outputs.run == 'true' && steps.gate.outputs.trusted == 'true'
+        uses: ./.github/actions/commit-status
+        with:
+          sha: ${{ steps.gate.outputs.sha }}
+          context: Integration Tests
+          state: pending
+
+      - name: Mark the Compose commit status pending
+        if: steps.gate.outputs.run == 'true' && steps.gate.outputs.trusted == 'true'
+        uses: ./.github/actions/commit-status
+        with:
+          sha: ${{ steps.gate.outputs.sha }}
+          context: Compose Integration Tests
+          state: pending
+
   flutter-build:
     name: Flutter SwiftPM build (${{ matrix.os }})
+    needs: gate
+    if: needs.gate.outputs.run == 'true'
     permissions:
       contents: read
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-24.04, windows-2022]
+        os: [ubuntu-24.04, ubuntu-24.04-arm, windows-2022, windows-11-arm]
     runs-on: ${{ matrix.os }}
 
     steps:
-      # Fork PR code must never receive the private Apple SDK cache, so those
+      # Fork PR code must never receive the private Apple SDK or its URL, so those
       # runs stop after the toolchain checks instead of being skipped outright.
       - name: Resolve Darwin SDK availability
         id: darwin
         shell: bash
         env:
-          IS_FORK_PR: >-
-            ${{ github.event_name == 'pull_request' &&
-            github.event.pull_request.head.repo.full_name != github.repository }}
+          IS_FORK_PR: ${{ needs.gate.outputs.trusted != 'true' }}
         run: |
           set -euo pipefail
           if [[ "$IS_FORK_PR" == "true" ]]; then
             echo "available=false" >> "$GITHUB_OUTPUT"
             notice='Fork pull request: building the xcross CLI and toolchain'
-            notice="$notice only. The private Apple SDK cache and the iOS"
-            notice="$notice build steps run once a maintainer pushes the"
-            notice="$notice branch to this repository."
+            notice="$notice only. The private Apple SDK download and the iOS"
+            notice="$notice build steps run when a maintainer comments /check on the"
+            notice="$notice pull request."
             echo "::notice::$notice"
           else
             echo "available=true" >> "$GITHUB_OUTPUT"
@@ -60,6 +119,1443 @@ jobs:
       - name: Checkout
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6
         with:
+          ref: ${{ needs.gate.outputs.sha }}
+          persist-credentials: false
+
+      - name: Update example submodule
+        shell: bash
+        run: git submodule update --init --checkout examples
+
+      - name: Use JDK 21 on Linux
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$RUNNER_ARCH" in
+            ARM64)
+              jdk="${JAVA_HOME_21_ARM64:-${JAVA_HOME_21_arm64:-${JAVA_HOME_21_X64:-}}}"
+              expected_arch='aarch64|arm64'
+              ;;
+            X64)
+              jdk="${JAVA_HOME_21_X64:?JDK 21 x64 is required}"
+              expected_arch='amd64|x86_64'
+              ;;
+            *) echo "Unsupported runner architecture: $RUNNER_ARCH"; exit 1 ;;
+          esac
+          test -n "$jdk"
+          echo "JAVA_HOME=$jdk" >> "$GITHUB_ENV"
+          echo "$jdk/bin" >> "$GITHUB_PATH"
+          "$jdk/bin/java" -XshowSettings:properties -version 2>&1 |
+            tee "$RUNNER_TEMP/java-properties.txt"
+          grep -Eq "os.arch = ($expected_arch)" "$RUNNER_TEMP/java-properties.txt"
+          grep -Eq 'java.specification.version = 21$' "$RUNNER_TEMP/java-properties.txt"
+
+      - name: Use JDK 21 on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $names = switch ($env:RUNNER_ARCH) {
+            'ARM64' {
+              'JAVA_HOME_21_AARCH64', 'JAVA_HOME_21_ARM64', 'JAVA_HOME_21_arm64'
+            }
+            'X64' { 'JAVA_HOME_21_X64' }
+            default { throw "Unsupported runner architecture: $env:RUNNER_ARCH" }
+          }
+          $jdk = $names |
+            ForEach-Object { [Environment]::GetEnvironmentVariable($_) } |
+            Where-Object { $_ } |
+            Select-Object -First 1
+          if (-not $jdk) {
+            throw "None of $($names -join ', ') is available on this runner"
+          }
+          "JAVA_HOME=$jdk" |
+            Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+          "$jdk\bin" |
+            Out-File $env:GITHUB_PATH -Encoding utf8 -Append
+          $properties = (& "$jdk\bin\java.exe" -XshowSettings:properties -version 2>&1 |
+            Out-String)
+          Write-Host $properties
+          $expectedArch = if ($env:RUNNER_ARCH -eq 'ARM64') { 'aarch64|arm64' } else { 'amd64|x86_64' }
+          if ($properties -notmatch "os\.arch = ($expectedArch)") {
+            throw "JDK at $jdk does not match runner architecture $env:RUNNER_ARCH"
+          }
+          if ($properties -notmatch 'java\.specification\.version = 21\r?\n') {
+            throw "JDK at $jdk is not Java 21"
+          }
+
+      - name: Install Flutter on Linux
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone \
+            --depth 1 \
+            --branch "$FLUTTER_VERSION" \
+            https://github.com/flutter/flutter.git \
+            "$RUNNER_TEMP/flutter"
+          echo "$RUNNER_TEMP/flutter/bin" >> "$GITHUB_PATH"
+
+      - name: Install Flutter on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          git clone `
+            --config core.autocrlf=false `
+            --config core.eol=lf `
+            --depth 1 `
+            --branch $env:FLUTTER_VERSION `
+            https://github.com/flutter/flutter.git `
+            "$env:RUNNER_TEMP\flutter"
+          "$env:RUNNER_TEMP\flutter\bin" |
+            Out-File $env:GITHUB_PATH -Encoding utf8 -Append
+
+      # The Windows ADI bridge is compiled by a Dart build hook through
+      # native_toolchain_c, which resolves MSVC with `vswhere -requires
+      # Microsoft.VisualStudio.Component.VC.Tools.<arch>`. Verify that query
+      # succeeds and add the component when the runner image lacks it.
+      - name: Ensure MSVC tools on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          MSVC_ARCHITECTURE: ${{ runner.arch == 'ARM64' && 'arm64' || 'x64' }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $component = switch ($env:MSVC_ARCHITECTURE) {
+            'x64' { 'Microsoft.VisualStudio.Component.VC.Tools.x86.x64' }
+            'arm64' { 'Microsoft.VisualStudio.Component.VC.Tools.ARM64' }
+            default { throw "Unsupported MSVC architecture: $env:MSVC_ARCHITECTURE" }
+          }
+          $installerDir = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer"
+          $vswhere = Join-Path $installerDir 'vswhere.exe'
+          if (-not (Test-Path $vswhere)) {
+            throw "vswhere.exe not found at $vswhere"
+          }
+          function Find-Msvc {
+            & $vswhere -latest -products '*' -requires $component `
+              -property installationPath
+          }
+          $installation = Find-Msvc
+          if (-not $installation) {
+            $visualStudio = & $vswhere -latest -products '*' -property installationPath
+            if (-not $visualStudio) {
+              throw 'No Visual Studio installation found on this runner'
+            }
+            Write-Host "Adding $component to $visualStudio"
+            $process = Start-Process `
+              (Join-Path $installerDir 'vs_installer.exe') `
+              -ArgumentList 'modify', '--installPath', "`"$visualStudio`"", `
+                '--add', $component, '--quiet', '--norestart', '--nocache' `
+              -PassThru `
+              -Wait
+            if ($process.ExitCode -notin 0, 3010) {
+              throw "Visual Studio installer failed: $($process.ExitCode)"
+            }
+            $installation = Find-Msvc
+            if (-not $installation) {
+              throw "$component is still missing after installation"
+            }
+          }
+          Write-Host "MSVC ${env:MSVC_ARCHITECTURE} tools: $installation"
+
+      - name: Install pinned Swift on Linux
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$RUNNER_ARCH" in
+            ARM64) arch=aarch64; platform=ubuntu2404-aarch64; suffix=-aarch64 ;;
+            X64) arch=x86_64; platform=ubuntu2404; suffix= ;;
+            *) echo "Unsupported runner architecture: $RUNNER_ARCH"; exit 1 ;;
+          esac
+          tag="(swift-${SWIFT_VERSION%.0}-RELEASE)"
+          current="$(swift --version 2>/dev/null || true)"
+          if ! grep -Fq "$tag" <<< "$current" ||
+              ! grep -Eq "Target: $arch-.*linux" <<< "$current"; then
+            sudo apt-get update
+            sudo apt-get install -y \
+              binutils git gnupg2 libc6-dev libcurl4-openssl-dev libedit2 \
+              libgcc-13-dev libncurses-dev libpython3-dev libsqlite3-0 \
+              libstdc++-13-dev libxml2-dev libz3-dev pkg-config tzdata \
+              zip unzip zlib1g-dev
+            release="swift-$SWIFT_VERSION-release"
+            version="swift-$SWIFT_VERSION-RELEASE"
+            archive="$version-ubuntu24.04$suffix.tar.gz"
+            base="https://download.swift.org/$release/$platform/$version"
+            download="$RUNNER_TEMP/swift-download"
+            mkdir -p "$download/gnupg" "$RUNNER_TEMP/swift"
+            chmod 700 "$download/gnupg"
+            curl --fail --location --retry 3 "$base/$archive" -o "$download/$archive"
+            curl --fail --location --retry 3 "$base/$archive.sig" -o "$download/$archive.sig"
+            curl --fail --location --compressed --retry 3 https://www.swift.org/keys/all-keys.asc \
+              -o "$download/all-keys.asc"
+            gzip -dcf "$download/all-keys.asc" > "$download/all-keys.txt"
+            gpg --batch --homedir "$download/gnupg" --import "$download/all-keys.txt"
+            gpg --batch --homedir "$download/gnupg" \
+              --verify "$download/$archive.sig" "$download/$archive"
+            tar -xzf "$download/$archive" -C "$RUNNER_TEMP/swift" --strip-components=1
+            echo "$RUNNER_TEMP/swift/usr/bin" >> "$GITHUB_PATH"
+            export PATH="$RUNNER_TEMP/swift/usr/bin:$PATH"
+          fi
+          swift --version | tee "$RUNNER_TEMP/swift-version.txt"
+          grep -Fq "$tag" "$RUNNER_TEMP/swift-version.txt"
+          grep -Eq "Target: $arch-.*linux" "$RUNNER_TEMP/swift-version.txt"
+          swift sdk list
+          printf 'print("ok")\n' > "$RUNNER_TEMP/swift-probe.swift"
+          swiftc -typecheck "$RUNNER_TEMP/swift-probe.swift"
+
+      - name: Install Linux requirements
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          flutter config --no-analytics
+          flutter precache --ios
+          dart pub get
+          (cd packages/xcross && dart run tool/build_xcross.dart)
+          cp -r packages/xcross/build/cli/*/bundle "$RUNNER_TEMP/xcross-bundle"
+          chmod +x "$RUNNER_TEMP/xcross-bundle/bin/xcross"
+          chmod +x "$RUNNER_TEMP/xcross-bundle/bin/xcrun"
+          "$RUNNER_TEMP/xcross-bundle/bin/xcross" setup
+          # Ubuntu's default clang 18 cannot compile the Xcode 26.5 SDK's
+          # libc++ 21 headers (notably __builtin_clzg). Match the lld-20
+          # installed by xcross setup with a recent Clang, and let
+          # resolveDarwinClang find it under /usr/lib/llvm-20/bin.
+          sudo apt-get install -y clang-20 llvm
+          clang-20 --version
+          tools=(
+            swift clang clang++ llvm-ar ld64.lld
+            llvm-readobj llvm-nm llvm-objdump
+          )
+          for tool in "${tools[@]}"; do command -v "$tool"; done
+
+      - name: Install official Swift and LLVM on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          # Authenticates direct.ps1's GitHub API lookups: anonymous calls
+          # share a 60/hour per-IP limit that hosted runners exhaust.
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # Pick the native toolchains for this runner; an emulated x64
+          # Swift or LLVM on ARM64 would hide host-architecture bugs.
+          switch ($env:RUNNER_ARCH) {
+            'ARM64' {
+              $swiftPlatform = 'windows10-arm64'
+              $swiftSha256 = $env:SWIFT_WINDOWS_ARM64_SHA256
+              $llvmAsset = "LLVM-$env:LLVM_VERSION-woa64.exe"
+              $llvmSha256 = $env:LLVM_WINDOWS_ARM64_SHA256
+              $hostTriple = 'aarch64-unknown-windows-msvc'
+              $cliDir = 'windows_arm64'
+            }
+            'X64' {
+              $swiftPlatform = 'windows10'
+              $swiftSha256 = $env:SWIFT_WINDOWS_X64_SHA256
+              $llvmAsset = "LLVM-$env:LLVM_VERSION-win64.exe"
+              $llvmSha256 = $env:LLVM_WINDOWS_X64_SHA256
+              $hostTriple = 'x86_64-unknown-windows-msvc'
+              $cliDir = 'windows_x64'
+            }
+            default { throw "Unsupported runner architecture: $env:RUNNER_ARCH" }
+          }
+          # Install the pinned toolchains through setup\direct.ps1, the same
+          # script `xcross setup` uses on hosts without a package manager:
+          # each installer is checked against the pinned SHA-256 (and Swift's
+          # Apple signature) before it runs.
+          $llvmRoot = "$env:RUNNER_TEMP\llvm-$env:LLVM_VERSION"
+          $env:XCROSS_SWIFT_VERSION = $env:SWIFT_VERSION
+          $env:XCROSS_SWIFT_SHA256 = $swiftSha256
+          $env:XCROSS_LLVM_VERSION = $env:LLVM_VERSION
+          $env:XCROSS_LLVM_SHA256 = $llvmSha256
+          $env:XCROSS_LLVM_DIR = $llvmRoot
+          # Runners already ship MSVC and Python; xcross setup installs
+          # pymobiledevice3 later in this step.
+          $env:XCROSS_SETUP_ONLY = 'swift,llvm'
+          & .\setup\direct.ps1 -Yes
+          if ($LASTEXITCODE -ne 0) { throw "direct.ps1 failed: $LASTEXITCODE" }
+          Remove-Item Env:XCROSS_SETUP_ONLY
+          $llvmBin = "$llvmRoot\bin"
+          if (-not (Test-Path "$llvmBin\ld64.lld.exe")) {
+            throw "Pinned LLVM missing ld64.lld.exe at $llvmBin"
+          }
+          $swiftRoot = "$env:LOCALAPPDATA\Programs\Swift"
+          # The installer registers its Runtimes, Toolchains, and Tools
+          # directories in the persisted PATH, but this job's environment
+          # predates the install. swift.exe cannot even start without the
+          # Runtimes DLLs, and Windows reports that as a bare exit code
+          # 3221225781 (0xC0000135, STATUS_DLL_NOT_FOUND), so re-export every
+          # directory the installer registered under the Swift root.
+          $swiftDirs = @(
+            [Environment]::GetEnvironmentVariable('Path', 'Machine')
+            [Environment]::GetEnvironmentVariable('Path', 'User')
+          ) -join ';' -split ';' |
+            Where-Object { $_ } |
+            ForEach-Object { $_.TrimEnd('\') } |
+            Where-Object { $_ -like "$swiftRoot*" } |
+            Select-Object -Unique
+          $swift = Get-ChildItem `
+            "$swiftRoot\Toolchains" `
+            -Filter swift.exe `
+            -File `
+            -Recurse `
+            -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+          if (-not $swift) {
+            throw 'Swift.Toolchain did not install swift.exe'
+          }
+          $runtime = Get-ChildItem `
+            "$swiftRoot\Runtimes" `
+            -Filter swiftCore.dll `
+            -File `
+            -Recurse `
+            -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+          if (-not $runtime) {
+            throw 'Swift.Runtime did not install swiftCore.dll'
+          }
+          $swiftDirs = @(
+            (Split-Path $runtime.FullName)
+            (Split-Path $swift.FullName)
+          ) + $swiftDirs | Select-Object -Unique
+          $swiftDirs | ForEach-Object { "  $_" } | Write-Host
+          $llvmBin | Out-File $env:GITHUB_PATH -Encoding utf8 -Append
+          $swiftDirs | Out-File $env:GITHUB_PATH -Encoding utf8 -Append
+          $env:Path = "$llvmBin;$($swiftDirs -join ';');$env:Path"
+          # SDKROOT is registered by the installer too, and it is what swiftc
+          # defaults `-sdk` to for *host* compiles. SwiftPM compiles every
+          # Package.swift manifest for the host before it ever looks at
+          # `--swift-sdk`, so without SDKROOT the cross build dies with
+          # "unable to load standard library for target '<host triple>'",
+          # e.g. x86_64- or aarch64-unknown-windows-msvc.
+          $sdkRoot = @(
+            [Environment]::GetEnvironmentVariable('SDKROOT', 'User')
+            [Environment]::GetEnvironmentVariable('SDKROOT', 'Machine')
+          ) | Where-Object { $_ } | Select-Object -First 1
+          if (-not $sdkRoot) {
+            $sdkRoot = Get-ChildItem `
+              "$swiftRoot\Platforms" `
+              -Filter Windows.sdk `
+              -Directory `
+              -Recurse `
+              -ErrorAction SilentlyContinue |
+              Select-Object -First 1 -ExpandProperty FullName
+          }
+          if (-not $sdkRoot -or -not (Test-Path $sdkRoot)) {
+            throw 'Swift.Platform did not install a Windows SDK (SDKROOT)'
+          }
+          Write-Host "  SDKROOT=$sdkRoot"
+          "SDKROOT=$sdkRoot" | Out-File $env:GITHUB_ENV -Encoding utf8 -Append
+          $env:SDKROOT = $sdkRoot
+          $tools = @(
+            'swift', 'clang', 'clang++', 'llvm-ar', 'ld64.lld',
+            'llvm-readobj', 'llvm-nm', 'llvm-objdump'
+          )
+          foreach ($tool in $tools) {
+            if (-not (Get-Command $tool -ErrorAction SilentlyContinue)) {
+              throw "Missing $tool"
+            }
+          }
+          # Runs swift.exe and the swift-sdk.exe subcommand binary, so a
+          # broken toolchain fails here instead of in a later step.
+          $swiftVersion = (& swift --version 2>&1 | Out-String)
+          if ($LASTEXITCODE -ne 0) {
+            throw "swift --version failed with $LASTEXITCODE"
+          }
+          Write-Host $swiftVersion
+          if ($swiftVersion -notmatch "Target:\s+$([regex]::Escape($hostTriple))") {
+            throw "Swift is not the native $hostTriple toolchain"
+          }
+          if (-not $swiftVersion.Contains("(swift-$($env:SWIFT_VERSION -replace '\.0$')-RELEASE)")) {
+            throw "Swift is not the pinned $env:SWIFT_VERSION release"
+          }
+          & swift sdk list
+          if ($LASTEXITCODE -ne 0) {
+            throw "swift sdk list failed with $LASTEXITCODE"
+          }
+          # Neither command above loads the standard library, so type-check a
+          # trivial file to prove SDKROOT actually resolves one.
+          $probe = "$env:RUNNER_TEMP\swift-probe.swift"
+          Set-Content $probe 'print("ok")' -Encoding utf8
+          & swiftc -typecheck $probe
+          if ($LASTEXITCODE -ne 0) {
+            throw "Host Swift stdlib unusable (SDKROOT=$env:SDKROOT)"
+          }
+
+          flutter config --no-analytics
+          flutter precache --ios
+          $dartVersion = (& dart --version 2>&1 | Out-String)
+          Write-Host $dartVersion
+          $dartArch = if ($env:RUNNER_ARCH -eq 'ARM64') { 'arm64' } else { 'x64' }
+          if ($dartVersion -notmatch "on `"windows_$dartArch`"") {
+            throw "Flutter's Dart SDK is not native windows_$dartArch"
+          }
+          dart pub get
+          Push-Location packages/xcross
+          dart run tool/build_xcross.dart
+          Pop-Location
+          Copy-Item -Recurse `
+            "packages/xcross/build/cli/$cliDir/bundle" `
+            "$env:RUNNER_TEMP\xcross-bundle"
+          # Exercise this checkout's direct.ps1 instead of the copy on main:
+          # the runners ship no winget, and direct.ps1 needs no package manager.
+          # Swift and LLVM are already pinned above, so it only verifies them
+          # and installs pymobiledevice3. --yes: CI has no terminal to confirm.
+          $xcrossConfig = "$env:RUNNER_TEMP\xcross-config.yaml"
+          $setupScript = (Resolve-Path 'setup\direct.ps1').Path
+          Set-Content $xcrossConfig "setup: '$setupScript'" -Encoding utf8
+          $env:XCROSS_CONFIG = $xcrossConfig
+          & "$env:RUNNER_TEMP\xcross-bundle\bin\xcross.exe" setup --yes
+          if ($LASTEXITCODE -ne 0) { throw "xcross setup failed: $LASTEXITCODE" }
+          Remove-Item Env:XCROSS_CONFIG
+
+      - name: Test doctor on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Push-Location packages/xcross
+          dart test test/cli/doctor_command_test.dart
+          Pop-Location
+          & "$env:RUNNER_TEMP\xcross-bundle\bin\xcross.exe" flutter doctor --help
+          if ($LASTEXITCODE -ne 0) { throw 'flutter doctor help failed' }
+          & "$env:RUNNER_TEMP\xcross-bundle\bin\xcross.exe" compose doctor --help
+          if ($LASTEXITCODE -ne 0) { throw 'compose doctor help failed' }
+
+      - name: Download Darwin SDK
+        if: steps.darwin.outputs.available == 'true'
+        uses: ./.github/actions/setup-darwin-sdk
+
+      - name: Restore open apple macros server
+        id: open-apple-macros
+        if: steps.darwin.outputs.available == 'true'
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        with:
+          path: |
+            ${{ runner.os == 'Windows' && '~/AppData/Local' || '~/.cache' }}/xcross/open-apple-macros/*/identity.json
+            ${{ runner.os == 'Windows' && '~/AppData/Local' || '~/.cache' }}/xcross/open-apple-macros/*/OpenAppleMacrosServer*
+          key: open-apple-macros-${{ runner.os }}-${{ runner.arch }}-swift-${{ env.SWIFT_VERSION }}-${{ hashFiles('.gitmodules', 'packages/xcross/lib/src/shared/swiftpm/open_apple_macros.dart') }}
+
+      - name: Add entitlements fixture to Flutter example
+        if: steps.darwin.outputs.available == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/ios_bundle_check.py add-entitlements examples/flutter_example/ios
+
+      - name: Build Flutter example on Linux
+        if: runner.os == 'Linux' && steps.darwin.outputs.available == 'true'
+        shell: bash
+        working-directory: examples/flutter_example
+        run: |
+          set -euo pipefail
+          "$RUNNER_TEMP/xcross-bundle/bin/xcross" --verbose flutter build
+
+      - name: Build Flutter example on Windows
+        if: runner.os == 'Windows' && steps.darwin.outputs.available == 'true'
+        shell: pwsh
+        working-directory: examples/flutter_example
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & "$env:RUNNER_TEMP\xcross-bundle\bin\xcross.exe" --verbose flutter build
+          if ($LASTEXITCODE -ne 0) { throw 'flutter_example build failed' }
+
+      - name: Save open apple macros server
+        if: ${{ !cancelled() && steps.darwin.outputs.available == 'true' && steps.open-apple-macros.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        with:
+          path: |
+            ${{ runner.os == 'Windows' && '~/AppData/Local' || '~/.cache' }}/xcross/open-apple-macros/*/identity.json
+            ${{ runner.os == 'Windows' && '~/AppData/Local' || '~/.cache' }}/xcross/open-apple-macros/*/OpenAppleMacrosServer*
+          key: open-apple-macros-${{ runner.os }}-${{ runner.arch }}-swift-${{ env.SWIFT_VERSION }}-${{ hashFiles('.gitmodules', 'packages/xcross/lib/src/shared/swiftpm/open_apple_macros.dart') }}
+
+      - name: Inspect Flutter example artifact on Linux
+        if: runner.os == 'Linux' && steps.darwin.outputs.available == 'true'
+        working-directory: examples/flutter_example
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          apps=(build/xcross-ios/*.app)
+          if [[ ${#apps[@]} -ne 1 ]]; then
+            printf 'Expected one .app, found %s\n' "${#apps[@]}"
+            exit 1
+          fi
+          runner="${apps[0]}/Runner"
+          test -f "$runner"
+          llvm-readobj --file-headers "$runner" | tee runner-headers.txt
+          grep -Eq 'Format: Mach-O arm64|Arch: aarch64' runner-headers.txt
+          llvm-objdump --macho --private-headers "$runner" |
+            grep -F '@executable_path/Frameworks'
+          dart run ../../packages/xcross/tool/verify_flutter_notices.dart build/xcross-ios
+          dart run ../../packages/xcross/tool/verify_flutter_shaders.dart build/xcross-ios
+
+      - name: Inspect Flutter example artifact on Windows
+        if: runner.os == 'Windows' && steps.darwin.outputs.available == 'true'
+        working-directory: examples/flutter_example
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $apps = @(Get-ChildItem build/xcross-ios -Directory -Filter *.app)
+          if ($apps.Count -ne 1) {
+            throw "Expected one .app, found $($apps.Count)"
+          }
+          $runner = Join-Path $apps[0].FullName 'Runner'
+          if (-not (Test-Path $runner -PathType Leaf)) {
+            throw "Missing $runner"
+          }
+          $headers = (& llvm-readobj --file-headers $runner | Out-String)
+          if ($LASTEXITCODE -ne 0 -or
+              ($headers -notmatch 'Format:\s+Mach-O arm64' -and
+               $headers -notmatch 'Arch:\s+aarch64')) {
+            throw "Runner is not ARM64 Mach-O:`n$headers"
+          }
+          $commands = (& llvm-objdump --macho --private-headers $runner | Out-String)
+          if ($LASTEXITCODE -ne 0 -or
+              $commands -notmatch '@executable_path/Frameworks') {
+            throw "Missing Frameworks rpath:`n$commands"
+          }
+          dart run ../../packages/xcross/tool/verify_flutter_notices.dart build/xcross-ios
+          if ($LASTEXITCODE -ne 0) { throw 'Packaged Flutter notices are invalid' }
+          dart run ../../packages/xcross/tool/verify_flutter_shaders.dart build/xcross-ios
+          if ($LASTEXITCODE -ne 0) { throw 'Packaged Flutter shaders are invalid' }
+
+      # `flutter build` never signs, and the device-only "Signing app" step needs
+      # an Apple account and a phone, so sign a copy of the built app with a
+      # throwaway identity to catch bundles the signer rejects (#118).
+      - name: Sign Flutter example artifact on Linux
+        if: runner.os == 'Linux' && steps.darwin.outputs.available == 'true'
+        shell: bash
+        working-directory: packages/apple_developer_kit
+        env:
+          XCROSS_SIGN_APP: ${{ github.workspace }}/examples/flutter_example/build/xcross-ios
+        run: |
+          set -euo pipefail
+          dart test test/signing/built_app_signing_test.dart --reporter expanded
+
+      - name: Sign Flutter example artifact on Windows
+        if: runner.os == 'Windows' && steps.darwin.outputs.available == 'true'
+        shell: pwsh
+        working-directory: packages/apple_developer_kit
+        env:
+          XCROSS_SIGN_APP: ${{ github.workspace }}\examples\flutter_example\build\xcross-ios
+        run: |
+          $ErrorActionPreference = 'Stop'
+          dart test test/signing/built_app_signing_test.dart --reporter expanded
+          if ($LASTEXITCODE -ne 0) { throw 'Signing the flutter_example artifact failed' }
+
+      - name: Verify bundle icons launch screen entitlements and IPA on Linux
+        if: runner.os == 'Linux' && steps.darwin.outputs.available == 'true'
+        shell: bash
+        working-directory: examples/flutter_example
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          check() { python3 "$GITHUB_WORKSPACE/.github/scripts/ios_bundle_check.py" "$1" \
+            --expect-icon AppIcon --expect-launch-image LaunchImage \
+            --expect-entitlements aps-environment com.apple.developer.associated-domains --no-private-keys \
+            --no-ib-sources \
+            --expect-bundle-file SDWebImage_SDWebImage.bundle/PrivacyInfo.xcprivacy \
+            google_mobile_ads_google_mobile_ads.bundle/GADTSmallTemplateView.nib \
+            google_mobile_ads_google_mobile_ads.bundle/GADTMediumTemplateView.nib \
+            google_mobile_ads_google_mobile_ads.bundle/GADTFullScreenTemplateView.nib \
+            --expect-lf GoogleSignIn_GoogleSignIn.bundle/en.lproj/GoogleSignIn.strings \
+            AppAuth_AppAuth.bundle/PrivacyInfo.xcprivacy \
+            SDWebImage_SDWebImage.bundle/PrivacyInfo.xcprivacy \
+            --no-loose-dylibs --expect-device-family 1,2 \
+            --expect-framework-file \
+            Frameworks/absl.framework/xcprivacy.bundle/PrivacyInfo.xcprivacy \
+            Frameworks/FirebaseFirestoreInternal.framework/FirebaseFirestoreInternal_Privacy.bundle/PrivacyInfo.xcprivacy \
+            Frameworks/GoogleCast.framework/PrivacyInfo.xcprivacy \
+            Frameworks/GoogleMobileAds.framework/PrivacyInfo.xcprivacy \
+            Frameworks/grpc.framework/grpc.bundle/PrivacyInfo.xcprivacy \
+            Frameworks/grpcpp.framework/grpcpp.bundle/PrivacyInfo.xcprivacy \
+            Frameworks/openssl_grpc.framework/openssl_grpc.bundle/PrivacyInfo.xcprivacy \
+            Frameworks/RecaptchaEnterpriseSDK.framework/PrivacyInfo.xcprivacy \
+            Frameworks/Sentry.framework/PrivacyInfo.xcprivacy \
+            Frameworks/UserMessagingPlatform.framework/PrivacyInfo.xcprivacy; }
+          apps=(build/xcross-ios/*.app)
+          test "${#apps[@]}" -eq 1
+          check "${apps[0]}"
+          "$RUNNER_TEMP/xcross-bundle/bin/xcross" --verbose flutter build --release --ipa
+          apps=(build/xcross-ios/*.app)
+          check "${apps[0]}"
+          ipas=(build/xcross-ios/*.ipa build/ios/ipa/*.ipa)
+          test "${#ipas[@]}" -ge 1
+          check "${ipas[0]}"
+
+      - name: Verify bundle icons launch screen entitlements and IPA on Windows
+        if: runner.os == 'Windows' && steps.darwin.outputs.available == 'true'
+        shell: pwsh
+        working-directory: examples/flutter_example
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $checker = Join-Path $env:GITHUB_WORKSPACE '.github/scripts/ios_bundle_check.py'
+          function Check($path) {
+            python $checker $path --expect-icon AppIcon --expect-launch-image LaunchImage `
+              --expect-entitlements aps-environment com.apple.developer.associated-domains --no-private-keys `
+              --no-ib-sources `
+              --expect-bundle-file SDWebImage_SDWebImage.bundle/PrivacyInfo.xcprivacy `
+              google_mobile_ads_google_mobile_ads.bundle/GADTSmallTemplateView.nib `
+              google_mobile_ads_google_mobile_ads.bundle/GADTMediumTemplateView.nib `
+              google_mobile_ads_google_mobile_ads.bundle/GADTFullScreenTemplateView.nib `
+              --expect-lf GoogleSignIn_GoogleSignIn.bundle/en.lproj/GoogleSignIn.strings `
+              AppAuth_AppAuth.bundle/PrivacyInfo.xcprivacy `
+              SDWebImage_SDWebImage.bundle/PrivacyInfo.xcprivacy `
+              --no-loose-dylibs --expect-device-family 1,2 `
+              --expect-framework-file `
+              Frameworks/absl.framework/xcprivacy.bundle/PrivacyInfo.xcprivacy `
+              Frameworks/FirebaseFirestoreInternal.framework/FirebaseFirestoreInternal_Privacy.bundle/PrivacyInfo.xcprivacy `
+              Frameworks/GoogleCast.framework/PrivacyInfo.xcprivacy `
+              Frameworks/GoogleMobileAds.framework/PrivacyInfo.xcprivacy `
+              Frameworks/grpc.framework/grpc.bundle/PrivacyInfo.xcprivacy `
+              Frameworks/grpcpp.framework/grpcpp.bundle/PrivacyInfo.xcprivacy `
+              Frameworks/openssl_grpc.framework/openssl_grpc.bundle/PrivacyInfo.xcprivacy `
+              Frameworks/RecaptchaEnterpriseSDK.framework/PrivacyInfo.xcprivacy `
+              Frameworks/Sentry.framework/PrivacyInfo.xcprivacy `
+              Frameworks/UserMessagingPlatform.framework/PrivacyInfo.xcprivacy
+            if ($LASTEXITCODE -ne 0) { throw "Bundle check failed for $path" }
+          }
+          $apps = @(Get-ChildItem build/xcross-ios -Directory -Filter *.app)
+          if ($apps.Count -ne 1) { throw "Expected one .app, found $($apps.Count)" }
+          Check $apps[0].FullName
+          & "$env:RUNNER_TEMP\xcross-bundle\bin\xcross.exe" --verbose flutter build --release --ipa
+          if ($LASTEXITCODE -ne 0) { throw 'flutter_example --ipa build failed' }
+          $apps = @(Get-ChildItem build/xcross-ios -Directory -Filter *.app)
+          Check $apps[0].FullName
+          $ipas = @(Get-ChildItem build -Recurse -Filter *.ipa)
+          if ($ipas.Count -lt 1) { throw 'No .ipa produced' }
+          Check $ipas[0].FullName
+
+      - name: Build Flutter example for ARM64 simulator on Linux
+        if: runner.os == 'Linux' && steps.darwin.outputs.available == 'true'
+        shell: bash
+        working-directory: examples/flutter_example
+        run: |
+          set -euo pipefail
+          "$RUNNER_TEMP/xcross-bundle/bin/xcross" --verbose flutter build --target-platform simulator --debug
+
+      - name: Build Flutter example for ARM64 simulator on Windows
+        if: runner.os == 'Windows' && steps.darwin.outputs.available == 'true'
+        shell: pwsh
+        working-directory: examples/flutter_example
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & "$env:RUNNER_TEMP\xcross-bundle\bin\xcross.exe" --verbose flutter build --target-platform simulator --debug
+          if ($LASTEXITCODE -ne 0) { throw 'flutter_example simulator build failed' }
+
+      - name: Upload Flutter example release IPA
+        if: steps.darwin.outputs.available == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: flutter-example-ipa-${{ matrix.os }}
+          path: examples/flutter_example/build/xcross-ios/*.ipa
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload Flutter example simulator app
+        if: steps.darwin.outputs.available == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: flutter-example-simulator-${{ matrix.os }}
+          path: examples/flutter_example/build/xcross-ios-simulator/*.app
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Verify notices without native hooks on Linux
+        if: runner.os == 'Linux' && steps.darwin.outputs.available == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          flutter create --platforms=ios --project-name=license_smoke "$RUNNER_TEMP/license-smoke"
+          cd "$RUNNER_TEMP/license-smoke"
+          "$RUNNER_TEMP/xcross-bundle/bin/xcross" flutter build --no-pub --flavor=staging --dart-define=FLUTTER_APP_FLAVOR=explicit
+          dart run "$GITHUB_WORKSPACE/packages/xcross/tool/verify_flutter_notices.dart" build/xcross-ios
+
+      - name: Verify notices without native hooks on Windows
+        if: runner.os == 'Windows' && steps.darwin.outputs.available == 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          flutter create --platforms=ios --project-name=license_smoke "$env:RUNNER_TEMP/license-smoke"
+          if ($LASTEXITCODE -ne 0) { throw 'Creating no-hook fixture failed' }
+          Set-Location "$env:RUNNER_TEMP/license-smoke"
+          & "$env:RUNNER_TEMP\xcross-bundle\bin\xcross.exe" flutter build --no-pub --flavor=staging --dart-define=FLUTTER_APP_FLAVOR=explicit
+          if ($LASTEXITCODE -ne 0) { throw 'No-hook fixture build failed' }
+          dart run "$env:GITHUB_WORKSPACE/packages/xcross/tool/verify_flutter_notices.dart" build/xcross-ios
+          if ($LASTEXITCODE -ne 0) { throw 'Packaged Flutter notices are invalid' }
+
+      # aot_plugins resolves Dart plugin classes on every platform, so its
+      # kernel only matches flutter build ios with flutter_tools' registrant.
+      # Its snapshot embeds the app's absolute `file:` URIs, so the registrant
+      # itself is compared across hosts.
+      - name: Build precompiled Flutter apps on Linux
+        if: runner.os == 'Linux' && steps.darwin.outputs.available == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          flutter create --platforms=ios --project-name=aot_smoke "$RUNNER_TEMP/aot-smoke"
+          cp -R .github/fixtures/aot_plugins "$RUNNER_TEMP/aot-plugins"
+          flutter create --platforms=ios --project-name=aot_plugins "$RUNNER_TEMP/aot-plugins"
+          mkdir -p "$RUNNER_TEMP/aot-digests"
+          for app in smoke plugins; do
+            for mode in release profile; do
+              (cd "$RUNNER_TEMP/aot-$app" && "$RUNNER_TEMP/xcross-bundle/bin/xcross" --verbose flutter build "--$mode")
+              dart run "$GITHUB_WORKSPACE/packages/xcross/tool/verify_flutter_aot.dart" \
+                "$RUNNER_TEMP/aot-$app/build/xcross-ios" --dsym=required \
+                "--write=$RUNNER_TEMP/aot-digests/$app-$mode.json"
+              if [ "$app" = plugins ]; then
+                mkdir -p "$RUNNER_TEMP/aot-apps/$mode"
+                cp -R "$RUNNER_TEMP/aot-plugins/build/xcross-ios/aot_plugins.app" "$RUNNER_TEMP/aot-apps/$mode/"
+              fi
+            done
+          done
+          cp "$RUNNER_TEMP/aot-plugins/.dart_tool/flutter_build/dart_plugin_registrant.dart" \
+            "$RUNNER_TEMP/aot-digests/plugins-registrant.dart"
+
+      # The pinned LLVM Windows installers ship no dsymutil and the Swift
+      # toolchain's asserts build crashes on gen_snapshot's DWARF, so a dSYM is
+      # optional here but must match App's LC_UUID when one is written.
+      - name: Build precompiled Flutter apps on Windows
+        if: runner.os == 'Windows' && steps.darwin.outputs.available == 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          flutter create --platforms=ios --project-name=aot_smoke "$env:RUNNER_TEMP/aot-smoke"
+          if ($LASTEXITCODE -ne 0) { throw 'Creating the AOT fixture failed' }
+          Copy-Item -Recurse .github/fixtures/aot_plugins "$env:RUNNER_TEMP/aot-plugins"
+          flutter create --platforms=ios --project-name=aot_plugins "$env:RUNNER_TEMP/aot-plugins"
+          if ($LASTEXITCODE -ne 0) { throw 'Creating the AOT plugin fixture failed' }
+          New-Item -ItemType Directory -Force "$env:RUNNER_TEMP/aot-digests" | Out-Null
+          foreach ($app in 'smoke', 'plugins') {
+            foreach ($mode in 'release', 'profile') {
+              Push-Location "$env:RUNNER_TEMP/aot-$app"
+              & "$env:RUNNER_TEMP\xcross-bundle\bin\xcross.exe" --verbose flutter build "--$mode"
+              $code = $LASTEXITCODE
+              Pop-Location
+              if ($code -ne 0) { throw "xcross flutter build --$mode of aot-$app failed" }
+              dart run "$env:GITHUB_WORKSPACE/packages/xcross/tool/verify_flutter_aot.dart" `
+                "$env:RUNNER_TEMP/aot-$app/build/xcross-ios" --dsym=optional `
+                "--write=$env:RUNNER_TEMP/aot-digests/$app-$mode.json"
+              if ($LASTEXITCODE -ne 0) { throw "Precompiled $mode aot-$app is invalid" }
+              if ($app -eq 'plugins') {
+                New-Item -ItemType Directory -Force "$env:RUNNER_TEMP/aot-apps/$mode" | Out-Null
+                Copy-Item -Recurse "$env:RUNNER_TEMP/aot-plugins/build/xcross-ios/aot_plugins.app" "$env:RUNNER_TEMP/aot-apps/$mode/"
+              }
+            }
+          }
+          Copy-Item "$env:RUNNER_TEMP/aot-plugins/.dart_tool/flutter_build/dart_plugin_registrant.dart" `
+            "$env:RUNNER_TEMP/aot-digests/plugins-registrant.dart"
+
+      - name: Upload precompiled app digests
+        if: steps.darwin.outputs.available == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: flutter-aot-digests-${{ matrix.os }}
+          path: ${{ runner.temp }}/aot-digests
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload precompiled apps
+        if: steps.darwin.outputs.available == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: flutter-aot-apps-${{ matrix.os }}
+          path: ${{ runner.temp }}/aot-apps
+          if-no-files-found: error
+          retention-days: 7
+
+  # The Linux and Windows device builds of the AOT fixture run as Mac Catalyst
+  # on Apple silicon: their iOS arm64 Mach-Os are retargeted, not rebuilt.
+  flutter-aot-run:
+    name: Run cross-built precompiled apps (Mac Catalyst)
+    needs: [gate, flutter-build]
+    if: >-
+      ${{ !cancelled() && needs.gate.outputs.run == 'true' &&
+      needs.gate.outputs.trusted == 'true' }}
+    permissions:
+      contents: read
+      actions: read
+    runs-on: macos-15
+    timeout-minutes: 30
+    env:
+      AOT_RUN_HOSTS: ubuntu-24.04 ubuntu-24.04-arm windows-2022 windows-11-arm
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          ref: ${{ needs.gate.outputs.sha }}
+          persist-credentials: false
+
+      - name: Download precompiled apps
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          pattern: flutter-aot-apps-*
+          path: ${{ runner.temp }}/aot-apps
+
+      - name: Run release and profile apps as Mac Catalyst
+        shell: bash
+        run: |
+          set -uo pipefail
+          failed=0
+          for host in $AOT_RUN_HOSTS; do
+            for mode in release profile; do
+              echo "::group::$host $mode"
+              python3 .github/scripts/aot_run_smoke.py \
+                "$RUNNER_TEMP/aot-apps/flutter-aot-apps-$host/$mode" --mode "$mode" \
+                --ready-marker "XCROSS_AOT_READY mode=$mode probe=ios build=2.3.4+56" \
+                --output "$RUNNER_TEMP/aot-run/$host/$mode" ||
+                { echo "::error::$host $mode app did not run"; failed=1; }
+              echo '::endgroup::'
+            done
+          done
+          exit "$failed"
+
+      - name: Upload run evidence
+        if: failure() || cancelled()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: flutter-aot-run-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/aot-run
+          if-no-files-found: warn
+          retention-days: 7
+
+  flutter-aot-parity:
+    name: Flutter AOT parity
+    needs: [gate, flutter-build, flutter-aot-reference]
+    if: >-
+      ${{ !cancelled() && needs.gate.outputs.run == 'true' &&
+      needs.gate.outputs.trusted == 'true' }}
+    permissions:
+      contents: read
+      actions: read
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      AOT_HOSTS: ubuntu-24.04 ubuntu-24.04-arm windows-2022 windows-11-arm
+      AOT_APPS: smoke plugins
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          ref: ${{ needs.gate.outputs.sha }}
+          persist-credentials: false
+
+      - name: Set up Dart
+        uses: dart-lang/setup-dart@65eb853c7ba17dde3be364c3d2858773e7144260
+        with:
+          sdk: stable
+
+      - name: Resolve dependencies
+        run: dart pub get
+
+      - name: Download flutter build ios digests
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: flutter-aot-reference
+          path: ${{ runner.temp }}/reference
+
+      - name: Download cross-built digests
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          pattern: flutter-aot-digests-*
+          path: ${{ runner.temp }}/cross
+
+      - name: Compare release digests with flutter build ios (App __const of aot_plugins embeds its absolute path)
+        shell: bash
+        run: |
+          set -uo pipefail
+          failed=0
+          for host in $AOT_HOSTS; do
+            for app in $AOT_APPS; do
+              sections=__text,__const,Flutter.__text
+              [ "$app" = plugins ] && sections=__text,Flutter.__text
+              echo "::group::$host $app release"
+              dart run packages/xcross/tool/verify_flutter_aot.dart \
+                "$RUNNER_TEMP/cross/flutter-aot-digests-$host/$app-release.json" \
+                "--expect=$RUNNER_TEMP/reference/$app-release.json" \
+                "--sections=$sections" ||
+                { echo "::error::$host $app release differs from flutter build ios"; failed=1; }
+              echo '::endgroup::'
+            done
+          done
+          exit "$failed"
+
+      - name: Compare profile digests with flutter build ios (profile App embeds absolute file URIs)
+        shell: bash
+        run: |
+          set -uo pipefail
+          failed=0
+          for host in $AOT_HOSTS; do
+            for app in $AOT_APPS; do
+              sections=__text,Flutter.__text
+              [ "$app" = plugins ] && sections=Flutter.__text
+              echo "::group::$host $app profile"
+              dart run packages/xcross/tool/verify_flutter_aot.dart \
+                "$RUNNER_TEMP/cross/flutter-aot-digests-$host/$app-profile.json" \
+                "--expect=$RUNNER_TEMP/reference/$app-profile.json" \
+                "--sections=$sections" ||
+                { echo "::error::$host $app profile differs from flutter build ios"; failed=1; }
+              echo '::endgroup::'
+            done
+          done
+          exit "$failed"
+
+      - name: Compare the Dart plugin registrant with flutter build ios
+        shell: bash
+        run: |
+          set -uo pipefail
+          failed=0
+          for host in $AOT_HOSTS; do
+            diff -u "$RUNNER_TEMP/reference/plugins-registrant.dart" \
+              "$RUNNER_TEMP/cross/flutter-aot-digests-$host/plugins-registrant.dart" ||
+              { echo "::error::$host Dart plugin registrant differs from flutter build ios"; failed=1; }
+          done
+          exit "$failed"
+
+  flutter-aot-reference:
+    name: Flutter AOT reference (macOS)
+    needs: gate
+    if: needs.gate.outputs.run == 'true' && needs.gate.outputs.trusted == 'true'
+    permissions:
+      contents: read
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          ref: ${{ needs.gate.outputs.sha }}
+          persist-credentials: false
+
+      - name: Select compatible native Xcode
+        uses: ./.github/actions/configure-xcode
+
+      - name: Install Flutter
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch "$FLUTTER_VERSION" \
+            https://github.com/flutter/flutter.git "$RUNNER_TEMP/flutter"
+          echo "$RUNNER_TEMP/flutter/bin" >> "$GITHUB_PATH"
+
+      - name: Record flutter build ios digests
+        shell: bash
+        run: |
+          set -euo pipefail
+          flutter config --no-analytics
+          flutter precache --ios
+          dart pub get
+          flutter create --platforms=ios --project-name=aot_smoke "$RUNNER_TEMP/aot-smoke"
+          cp -R .github/fixtures/aot_plugins "$RUNNER_TEMP/aot-plugins"
+          flutter create --platforms=ios --project-name=aot_plugins "$RUNNER_TEMP/aot-plugins"
+          mkdir -p "$RUNNER_TEMP/aot-reference"
+          for app in smoke plugins; do
+            for mode in release profile; do
+              (cd "$RUNNER_TEMP/aot-$app" && flutter build ios "--$mode" --no-codesign)
+              dart run packages/xcross/tool/verify_flutter_aot.dart \
+                "$RUNNER_TEMP/aot-$app/build/ios/iphoneos/Runner.app" \
+                "--write=$RUNNER_TEMP/aot-reference/$app-$mode.json"
+            done
+          done
+          cp "$RUNNER_TEMP/aot-plugins/.dart_tool/flutter_build/dart_plugin_registrant.dart" \
+            "$RUNNER_TEMP/aot-reference/plugins-registrant.dart"
+
+      - name: Upload digests
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: flutter-aot-reference
+          path: ${{ runner.temp }}/aot-reference
+          if-no-files-found: error
+          retention-days: 7
+
+  flutter-simulator:
+    name: Flutter ARM64 iOS Simulator
+    needs: gate
+    if: needs.gate.outputs.run == 'true' && needs.gate.outputs.trusted == 'true'
+    runs-on: macos-15
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          ref: ${{ needs.gate.outputs.sha }}
+          persist-credentials: false
+
+      - name: Update example submodule
+        shell: bash
+        run: git submodule update --init --checkout examples
+
+      - name: Test simulator CI helpers without simulator access
+        run: python3 -m unittest discover -s .github/scripts -p 'test_*.py' -v
+
+      - name: Select compatible native Xcode
+        id: xcode
+        uses: ./.github/actions/configure-xcode
+
+      - name: Restore open apple macros server
+        id: open-apple-macros
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        with:
+          path: |
+            ${{ runner.temp }}/xcross-cache/open-apple-macros/*/identity.json
+            ${{ runner.temp }}/xcross-cache/open-apple-macros/*/OpenAppleMacrosServer
+          key: open-apple-macros-${{ runner.os }}-${{ runner.arch }}-${{ steps.xcode.outputs.app }}-${{ hashFiles('.gitmodules', 'packages/xcross/lib/src/shared/swiftpm/open_apple_macros.dart') }}
+
+      - name: Install native Flutter and LLVM toolchains
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(/usr/bin/uname -m)" = arm64
+          git clone --depth 1 --branch "$FLUTTER_VERSION" \
+            https://github.com/flutter/flutter.git "$RUNNER_TEMP/flutter"
+          brew install llvm lld
+          {
+            echo "$(brew --prefix llvm)/bin"
+            echo "$(brew --prefix lld)/bin"
+            echo "$DEVELOPER_DIR/Toolchains/XcodeDefault.xctoolchain/usr/bin"
+            echo "$RUNNER_TEMP/flutter/bin"
+          } >> "$GITHUB_PATH"
+
+      - name: Build native production xcross CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          flutter config --no-analytics
+          flutter precache --ios
+          dart pub get
+          (cd packages/xcross && dart run tool/build_xcross.dart)
+          shopt -s nullglob
+          bundles=(packages/xcross/build/cli/*/bundle)
+          test "${#bundles[@]}" -eq 1
+          cp -R "${bundles[0]}" "$RUNNER_TEMP/xcross-bundle"
+          /usr/bin/xcrun lipo "$RUNNER_TEMP/xcross-bundle/bin/xcross" -verify_arch arm64
+          echo "$RUNNER_TEMP/xcross-bundle/bin" >> "$GITHUB_PATH"
+          swift --version
+
+      - name: Install selected native Xcode SDK through xcross
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcross sdk install "$XCODE_APP" 2>&1 | \
+            tee "$RUNNER_TEMP/ios-simulator-smoke/sdk-install.log"
+
+      - name: Install Flutter example Rust toolchain with preinstalled rustup
+        shell: bash
+        working-directory: examples/flutter_example/rust
+        run: |
+          set -euo pipefail
+          channel="$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)"
+          test -n "$channel"
+          rustup --version
+          rustup toolchain install "$channel" --profile minimal \
+            --target aarch64-apple-ios-sim --target aarch64-apple-ios
+          rustup show active-toolchain | grep -F "$channel"
+          rustup +"$channel" target list --installed | tee "$RUNNER_TEMP/rust-targets.txt"
+          grep -qx aarch64-apple-ios-sim "$RUNNER_TEMP/rust-targets.txt"
+          grep -qx aarch64-apple-ios "$RUNNER_TEMP/rust-targets.txt"
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Build Flutter example for ARM64 simulator through production xcross
+        shell: bash
+        working-directory: examples/flutter_example
+        run: |
+          set -euo pipefail
+          xcross --verbose flutter build --target-platform simulator --debug 2>&1 | \
+            tee "$RUNNER_TEMP/ios-simulator-smoke/flutter-example-build.log"
+
+      - name: Save open apple macros server
+        if: ${{ !cancelled() && steps.open-apple-macros.outputs.cache-hit != 'true' }}
+        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        with:
+          path: |
+            ${{ runner.temp }}/xcross-cache/open-apple-macros/*/identity.json
+            ${{ runner.temp }}/xcross-cache/open-apple-macros/*/OpenAppleMacrosServer
+          key: open-apple-macros-${{ runner.os }}-${{ runner.arch }}-${{ steps.xcode.outputs.app }}-${{ hashFiles('.gitmodules', 'packages/xcross/lib/src/shared/swiftpm/open_apple_macros.dart') }}
+
+      - name: Boot install launch and observe Flutter example headlessly
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          apps=(examples/flutter_example/build/xcross-ios-simulator/*.app)
+          test "${#apps[@]}" -eq 1
+          python3 .github/scripts/simulator_smoke.py "${apps[0]}" \
+            --output "$RUNNER_TEMP/ios-simulator-smoke/flutter-example" \
+            --observe-seconds 30 --grace-seconds 10 \
+            --ready-marker XCROSS_FLUTTER_EXAMPLE_READY
+
+      - name: Stage simulator screenshots for the report
+        if: success()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: simulator-report-flutter-native
+          path: |
+            ${{ runner.temp }}/ios-simulator-smoke/*/screenshot.png
+            ${{ runner.temp }}/ios-simulator-smoke/*/result.json
+          if-no-files-found: warn
+          retention-days: 1
+
+      - name: Upload the screenshot for the report link
+        if: success()
+        uses: ./.github/actions/simulator-screenshot
+        with:
+          screenshot: ${{ runner.temp }}/ios-simulator-smoke/flutter-example/screenshot.png
+          slug: flutter-native-flutter-example
+
+      - name: Upload simulator evidence
+        if: failure() || cancelled()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: flutter-arm64-ios-simulator-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/ios-simulator-smoke
+          if-no-files-found: warn
+          retention-days: 7
+
+  flutter-example-simulator-run:
+    name: Run cross-built Flutter example on simulator (${{ matrix.host }})
+    needs: [gate, flutter-build]
+    if: >-
+      ${{ !cancelled() && needs.gate.outputs.run == 'true' &&
+      needs.gate.outputs.trusted == 'true' }}
+    permissions:
+      contents: read
+      actions: read
+    strategy:
+      fail-fast: false
+      matrix:
+        host: [ubuntu-24.04, ubuntu-24.04-arm, windows-2022, windows-11-arm]
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          ref: ${{ needs.gate.outputs.sha }}
+          persist-credentials: false
+
+      - name: Select compatible native Xcode
+        uses: ./.github/actions/configure-xcode
+
+      - name: Download cross-built simulator app
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: flutter-example-simulator-${{ matrix.host }}
+          path: ${{ runner.temp }}/cross-built
+
+      - name: Verify cross-built simulator bundle resources
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          apps=("$RUNNER_TEMP/cross-built/"*.app)
+          test "${#apps[@]}" -eq 1
+          python3 .github/scripts/ios_bundle_check.py "${apps[0]}" \
+            --expect-icon AppIcon --expect-launch-image LaunchImage \
+            --no-ib-sources \
+            --expect-bundle-file SDWebImage_SDWebImage.bundle/PrivacyInfo.xcprivacy \
+            google_mobile_ads_google_mobile_ads.bundle/GADTSmallTemplateView.nib \
+            google_mobile_ads_google_mobile_ads.bundle/GADTMediumTemplateView.nib \
+            google_mobile_ads_google_mobile_ads.bundle/GADTFullScreenTemplateView.nib \
+            --no-loose-dylibs --expect-device-family 1,2 \
+            --expect-framework-file \
+            Frameworks/absl.framework/xcprivacy.bundle/PrivacyInfo.xcprivacy \
+            Frameworks/FirebaseFirestoreInternal.framework/FirebaseFirestoreInternal_Privacy.bundle/PrivacyInfo.xcprivacy \
+            Frameworks/GoogleCast.framework/PrivacyInfo.xcprivacy \
+            Frameworks/GoogleMobileAds.framework/PrivacyInfo.xcprivacy \
+            Frameworks/grpc.framework/grpc.bundle/PrivacyInfo.xcprivacy \
+            Frameworks/grpcpp.framework/grpcpp.bundle/PrivacyInfo.xcprivacy \
+            Frameworks/openssl_grpc.framework/openssl_grpc.bundle/PrivacyInfo.xcprivacy \
+            Frameworks/RecaptchaEnterpriseSDK.framework/PrivacyInfo.xcprivacy \
+            Frameworks/Sentry.framework/PrivacyInfo.xcprivacy \
+            Frameworks/UserMessagingPlatform.framework/PrivacyInfo.xcprivacy
+          xcrun assetutil --info "${apps[0]}/Assets.car" > "$RUNNER_TEMP/assets.json"
+          python3 - "$RUNNER_TEMP/assets.json" <<'PY'
+          import json, sys
+          items = json.load(open(sys.argv[1]))
+          names = {i.get("Name") for i in items}
+          kinds = {(i.get("AssetType"), i.get("Idiom")) for i in items}
+          assert "LaunchImage" in names, names
+          # The app icon renditions actool writes for a per-size icon set.
+          for kind in [("Icon Image", "phone"), ("Icon Image", "pad"),
+                       ("Icon Image", "marketing"), ("MultiSized Image", "phone"),
+                       ("MultiSized Image", "pad")]:
+              assert kind in kinds, (kind, sorted(map(str, kinds)))
+          print("assetutil ok:", sorted(n for n in names if n))
+          PY
+
+      - name: Compare cross-built nibs with ibtool output
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          apps=("$RUNNER_TEMP/cross-built/"*.app)
+          test "${#apps[@]}" -eq 1
+          # The pub cache and the examples submodule are absent on this
+          # runner; the bundle identifier carries the plugin version Xcode
+          # would have used (google-mobile-ads-<version>.google-mobile-ads.resources).
+          bundle="${apps[0]}/google_mobile_ads_google_mobile_ads.bundle"
+          identifier="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$bundle/Info.plist")"
+          version="$(sed -nE 's/^google-mobile-ads-([0-9][^.]*\.[0-9]+\.[0-9]+[^.]*)\.google-mobile-ads\.resources$/\1/p' <<<"$identifier")"
+          test -n "$version" || { echo "::error::no google_mobile_ads version in $identifier"; exit 1; }
+          src="$RUNNER_TEMP/gma-src"
+          mkdir -p "$src"
+          curl -fsSL --retry 3 "https://pub.dev/api/archives/google_mobile_ads-${version}.tar.gz" \
+            | tar -xz -C "$src"
+          out="$RUNNER_TEMP/ibtool-out"
+          mkdir -p "$out"
+          bundle="${apps[0]}/google_mobile_ads_google_mobile_ads.bundle"
+          failed=0
+          for name in GADTSmallTemplateView GADTMediumTemplateView GADTFullScreenTemplateView; do
+            xib="$(find "$src" -name "$name.xib" | head -n 1)"
+            test -n "$xib" || { echo "::error::$name.xib not found in google_mobile_ads $version"; exit 1; }
+            xcrun ibtool --errors --warnings --module google_mobile_ads \
+              --target-device iphone --target-device ipad \
+              --minimum-deployment-target 13.0 --compile "$out/$name.nib" "$xib"
+            if ! cmp "$out/$name.nib" "$bundle/$name.nib"; then
+              echo "::error::NIB PARITY MISMATCH for $name.nib: cross-built output differs from ibtool ($(xcodebuild -version | tr '\n' ' '))"
+              echo "--- ibtool nib ---"; xxd "$out/$name.nib" | head -n 80
+              echo "--- cross-built nib ---"; xxd "$bundle/$name.nib" | head -n 80
+              failed=1
+            else
+              echo "nib parity ok: $name.nib"
+            fi
+          done
+          exit "$failed"
+
+      - name: Boot install launch and observe cross-built Flutter example headlessly
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          apps=("$RUNNER_TEMP/cross-built/"*.app)
+          test "${#apps[@]}" -eq 1
+          executable="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "${apps[0]}/Info.plist")"
+          chmod +x "${apps[0]}/$executable"
+          for framework in "${apps[0]}/Frameworks/"*.framework; do
+            chmod +x "$framework/$(basename "$framework" .framework)"
+          done
+          python3 .github/scripts/simulator_smoke.py "${apps[0]}" \
+            --output "$RUNNER_TEMP/ios-simulator-smoke/flutter-example" \
+            --observe-seconds 30 --grace-seconds 10 \
+            --ready-marker XCROSS_FLUTTER_EXAMPLE_READY
+
+      - name: Stage simulator screenshots for the report
+        if: success()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: simulator-report-flutter-${{ matrix.host }}
+          path: |
+            ${{ runner.temp }}/ios-simulator-smoke/*/screenshot.png
+            ${{ runner.temp }}/ios-simulator-smoke/*/result.json
+          if-no-files-found: warn
+          retention-days: 1
+
+      - name: Upload the screenshot for the report link
+        if: success()
+        uses: ./.github/actions/simulator-screenshot
+        with:
+          screenshot: ${{ runner.temp }}/ios-simulator-smoke/flutter-example/screenshot.png
+          slug: flutter-${{ matrix.host }}-flutter-example
+
+      - name: Upload simulator evidence
+        if: failure() || cancelled()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: flutter-example-simulator-run-${{ matrix.host }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/ios-simulator-smoke
+          if-no-files-found: warn
+          retention-days: 7
+
+  compose-simulator:
+    name: Compose ARM64 iOS Simulator
+    needs: gate
+    if: needs.gate.outputs.run == 'true' && needs.gate.outputs.trusted == 'true'
+    runs-on: macos-15
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          ref: ${{ needs.gate.outputs.sha }}
+          persist-credentials: false
+
+      - name: Update example submodule
+        shell: bash
+        run: git submodule update --init --checkout examples
+
+      - name: Select compatible native Xcode
+        uses: ./.github/actions/configure-xcode
+
+      - name: Install native Dart
+        uses: dart-lang/setup-dart@65eb853c7ba17dde3be364c3d2858773e7144260
+        with:
+          sdk: stable
+          architecture: arm64
+
+      - name: Select native JDK 21 and LLVM
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(/usr/bin/uname -m)" = arm64
+          jdk="$(/usr/libexec/java_home -v 21 -a arm64)"
+          "$jdk/bin/java" -XshowSettings:properties -version 2>&1 | \
+            tee "$RUNNER_TEMP/ios-simulator-smoke/java-properties.log"
+          grep -Eq 'os.arch = (aarch64|arm64)' \
+            "$RUNNER_TEMP/ios-simulator-smoke/java-properties.log"
+          grep -Eq 'java.specification.version = 21$' \
+            "$RUNNER_TEMP/ios-simulator-smoke/java-properties.log"
+          echo "JAVA_HOME=$jdk" >> "$GITHUB_ENV"
+          brew install llvm lld
+          {
+            echo "$jdk/bin"
+            echo "$(brew --prefix llvm)/bin"
+            echo "$(brew --prefix lld)/bin"
+            echo "$DEVELOPER_DIR/Toolchains/XcodeDefault.xctoolchain/usr/bin"
+          } >> "$GITHUB_PATH"
+
+      - name: Build native production xcross CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          dart pub get
+          (cd packages/xcross && dart run tool/build_xcross.dart)
+          shopt -s nullglob
+          bundles=(packages/xcross/build/cli/*/bundle)
+          test "${#bundles[@]}" -eq 1
+          cp -R "${bundles[0]}" "$RUNNER_TEMP/xcross-bundle"
+          /usr/bin/xcrun lipo "$RUNNER_TEMP/xcross-bundle/bin/xcross" -verify_arch arm64
+          echo "$RUNNER_TEMP/xcross-bundle/bin" >> "$GITHUB_PATH"
+          swift --version
+
+      - name: Install selected native Xcode SDK through xcross
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcross sdk install "$XCODE_APP" 2>&1 | \
+            tee "$RUNNER_TEMP/ios-simulator-smoke/sdk-install.log"
+
+      - name: Prepare scratch Compose simulator fixture
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/prepare_simulator_fixture.py compose \
+            "$RUNNER_TEMP/compose-simulator" --source examples/compose_app
+
+      - name: Cache Gradle distribution and dependencies
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        with:
+          path: |
+            ${{ runner.temp }}/gradle/wrapper/dists
+            ${{ runner.temp }}/gradle/caches/modules-2
+          key: gradle-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('examples/compose_app/gradle/wrapper/gradle-wrapper.properties', 'examples/compose_app/**/*.gradle.kts', 'examples/compose_app/gradle.properties') }}
+          restore-keys: |
+            gradle-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Pre-download Gradle wrapper with retry
+        shell: bash
+        working-directory: ${{ runner.temp }}/compose-simulator
+        env:
+          GRADLE_USER_HOME: ${{ runner.temp }}/gradle
+        run: bash "$GITHUB_WORKSPACE/.github/scripts/prefetch_gradle_wrapper.sh"
+
+      - name: Set up Compose toolchain
+        shell: bash
+        env:
+          GRADLE_USER_HOME: ${{ runner.temp }}/gradle
+        working-directory: ${{ runner.temp }}/compose-simulator
+        run: |
+          set -euo pipefail
+          xcross --verbose compose setup 2>&1 | \
+            tee "$RUNNER_TEMP/ios-simulator-smoke/compose-setup.log"
+
+      - name: Build ARM64 simulator app through production xcross
+        shell: bash
+        env:
+          GRADLE_USER_HOME: ${{ runner.temp }}/gradle
+        working-directory: ${{ runner.temp }}/compose-simulator
+        run: |
+          set -euo pipefail
+          xcross --verbose compose build --target-platform simulator 2>&1 | \
+            tee "$RUNNER_TEMP/ios-simulator-smoke/build.log"
+
+      - name: Boot install launch and observe Compose app headlessly
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          apps=("$RUNNER_TEMP/compose-simulator/build/xcross-ios-simulator/"*.app)
+          test "${#apps[@]}" -eq 1
+          python3 .github/scripts/simulator_smoke.py "${apps[0]}" \
+            --output "$RUNNER_TEMP/ios-simulator-smoke/compose" \
+            --ready-marker XCROSS_COMPOSE_READY
+
+      - name: Stage simulator screenshots for the report
+        if: success()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: simulator-report-compose-native
+          path: |
+            ${{ runner.temp }}/ios-simulator-smoke/*/screenshot.png
+            ${{ runner.temp }}/ios-simulator-smoke/*/result.json
+          if-no-files-found: warn
+          retention-days: 1
+
+      - name: Upload the screenshot for the report link
+        if: success()
+        uses: ./.github/actions/simulator-screenshot
+        with:
+          screenshot: ${{ runner.temp }}/ios-simulator-smoke/compose/screenshot.png
+          slug: compose-native-compose
+
+      - name: Upload simulator evidence
+        if: failure() || cancelled()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: compose-arm64-ios-simulator-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/ios-simulator-smoke
+          if-no-files-found: warn
+          retention-days: 7
+
+  compose-build:
+    name: Compose build (${{ matrix.os }})
+    needs: gate
+    if: needs.gate.outputs.run == 'true'
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2022]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+
+    steps:
+      # Fork PR code must never receive the private Apple SDK or its URL, so those
+      # runs stop after the toolchain checks instead of being skipped outright.
+      - name: Resolve Darwin SDK availability
+        id: darwin
+        shell: bash
+        env:
+          IS_FORK_PR: ${{ needs.gate.outputs.trusted != 'true' }}
+        run: |
+          set -euo pipefail
+          if [[ "$IS_FORK_PR" == "true" ]]; then
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            notice='Fork pull request: building the xcross CLI and toolchain'
+            notice="$notice only. The private Apple SDK download and the Compose"
+            notice="$notice build steps run when a maintainer comments /check on the"
+            notice="$notice pull request."
+            echo "::notice::$notice"
+          else
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6
+        with:
+          ref: ${{ needs.gate.outputs.sha }}
           persist-credentials: false
 
       - name: Update example submodule
@@ -90,55 +1586,81 @@ jobs:
             Out-File $env:GITHUB_PATH -Encoding utf8 -Append
           & "$env:JAVA_HOME_21_X64\bin\java.exe" -version
 
-      - name: Install Flutter on Linux
+      - name: Install Dart
+        uses: dart-lang/setup-dart@65eb853c7ba17dde3be364c3d2858773e7144260
+
+      - name: Set toolchain directories
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "KONAN_DATA_DIR=$RUNNER_TEMP/konan"
+            echo "GRADLE_USER_HOME=$RUNNER_TEMP/gradle"
+            echo "XCROSS_CACHE_DIR=$RUNNER_TEMP/xcross-cache"
+          } >> "$GITHUB_ENV"
+
+      - name: Install pinned Swift on Linux
         if: runner.os == 'Linux'
         shell: bash
         run: |
           set -euo pipefail
-          git clone \
-            --depth 1 \
-            --branch stable \
-            https://github.com/flutter/flutter.git \
-            "$RUNNER_TEMP/flutter"
-          echo "$RUNNER_TEMP/flutter/bin" >> "$GITHUB_PATH"
-
-      - name: Install Flutter on Windows
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          git clone `
-            --depth 1 `
-            --branch stable `
-            https://github.com/flutter/flutter.git `
-            "$env:RUNNER_TEMP\flutter"
-          "$env:RUNNER_TEMP\flutter\bin" |
-            Out-File $env:GITHUB_PATH -Encoding utf8 -Append
+          case "$RUNNER_ARCH" in
+            ARM64) arch=aarch64; platform=ubuntu2404-aarch64; suffix=-aarch64 ;;
+            X64) arch=x86_64; platform=ubuntu2404; suffix= ;;
+            *) echo "Unsupported runner architecture: $RUNNER_ARCH"; exit 1 ;;
+          esac
+          tag="(swift-${SWIFT_VERSION%.0}-RELEASE)"
+          current="$(swift --version 2>/dev/null || true)"
+          if ! grep -Fq "$tag" <<< "$current" ||
+              ! grep -Eq "Target: $arch-.*linux" <<< "$current"; then
+            sudo apt-get update
+            sudo apt-get install -y \
+              binutils git gnupg2 libc6-dev libcurl4-openssl-dev libedit2 \
+              libgcc-13-dev libncurses-dev libpython3-dev libsqlite3-0 \
+              libstdc++-13-dev libxml2-dev libz3-dev pkg-config tzdata \
+              zip unzip zlib1g-dev
+            release="swift-$SWIFT_VERSION-release"
+            version="swift-$SWIFT_VERSION-RELEASE"
+            archive="$version-ubuntu24.04$suffix.tar.gz"
+            base="https://download.swift.org/$release/$platform/$version"
+            download="$RUNNER_TEMP/swift-download"
+            mkdir -p "$download/gnupg" "$RUNNER_TEMP/swift"
+            chmod 700 "$download/gnupg"
+            curl --fail --location --retry 3 "$base/$archive" -o "$download/$archive"
+            curl --fail --location --retry 3 "$base/$archive.sig" -o "$download/$archive.sig"
+            curl --fail --location --compressed --retry 3 https://www.swift.org/keys/all-keys.asc \
+              -o "$download/all-keys.asc"
+            gzip -dcf "$download/all-keys.asc" > "$download/all-keys.txt"
+            gpg --batch --homedir "$download/gnupg" --import "$download/all-keys.txt"
+            gpg --batch --homedir "$download/gnupg" \
+              --verify "$download/$archive.sig" "$download/$archive"
+            tar -xzf "$download/$archive" -C "$RUNNER_TEMP/swift" --strip-components=1
+            echo "$RUNNER_TEMP/swift/usr/bin" >> "$GITHUB_PATH"
+            export PATH="$RUNNER_TEMP/swift/usr/bin:$PATH"
+          fi
+          swift --version | tee "$RUNNER_TEMP/swift-version.txt"
+          grep -Fq "$tag" "$RUNNER_TEMP/swift-version.txt"
+          grep -Eq "Target: $arch-.*linux" "$RUNNER_TEMP/swift-version.txt"
+          printf 'print("ok")\n' > "$RUNNER_TEMP/swift-probe.swift"
+          swiftc -typecheck "$RUNNER_TEMP/swift-probe.swift"
 
       - name: Install Linux requirements
         if: runner.os == 'Linux'
         shell: bash
         run: |
           set -euo pipefail
-          flutter config --no-analytics
-          flutter precache --ios
           dart pub get
           (cd packages/xcross && dart run tool/build_xcross.dart)
           cp -r packages/xcross/build/cli/*/bundle "$RUNNER_TEMP/xcross-bundle"
           chmod +x "$RUNNER_TEMP/xcross-bundle/bin/xcross"
           chmod +x "$RUNNER_TEMP/xcross-bundle/bin/xcrun"
+          echo "$RUNNER_TEMP/xcross-bundle/bin" >> "$GITHUB_PATH"
           "$RUNNER_TEMP/xcross-bundle/bin/xcross" setup
           # Ubuntu's default clang 18 cannot compile the Xcode 26.5 SDK's
-          # libc++ 21 headers (notably __builtin_clzg). Match the lld-20
-          # installed by xcross setup with a recent Clang, and let
-          # resolveDarwinClang find it under /usr/lib/llvm-20/bin.
-          sudo apt-get install -y clang-20 llvm
-          clang-20 --version
-          tools=(
-            swift clang clang++ llvm-ar ld64.lld
-            llvm-readobj llvm-nm llvm-objdump
-          )
-          for tool in "${tools[@]}"; do command -v "$tool"; done
+          # libc++ 21 headers; Kotlin/Native also needs llvm-libtool-darwin
+          # for compiler caches and static frameworks.
+          sudo apt-get install -y clang-20 llvm-20
+          echo "/usr/lib/llvm-20/bin" >> "$GITHUB_PATH"
 
       - name: Install official Swift and LLVM on Windows
         if: runner.os == 'Windows'
@@ -153,7 +1675,7 @@ jobs:
             "$version-windows10.exe"
           Invoke-WebRequest $url -OutFile $installer
           $hash = (Get-FileHash $installer -Algorithm SHA256).Hash
-          if ($hash -ne $env:SWIFT_WINDOWS_SHA256) {
+          if ($hash -ne $env:SWIFT_WINDOWS_X64_SHA256) {
             throw "Swift installer checksum mismatch: $hash"
           }
           $process = Start-Process `
@@ -171,7 +1693,7 @@ jobs:
             "llvmorg-$env:LLVM_VERSION/LLVM-$env:LLVM_VERSION-win64.exe"
           Invoke-WebRequest $llvmUrl -OutFile $llvmInstaller
           $llvmHash = (Get-FileHash $llvmInstaller -Algorithm SHA256).Hash
-          if ($llvmHash -ne $env:LLVM_WINDOWS_SHA256) {
+          if ($llvmHash -ne $env:LLVM_WINDOWS_X64_SHA256) {
             throw "LLVM installer checksum mismatch: $llvmHash"
           }
           $llvmProcess = Start-Process `
@@ -269,6 +1791,10 @@ jobs:
           if ($LASTEXITCODE -ne 0) {
             throw "swift --version failed with $LASTEXITCODE"
           }
+          $swiftVersion = (& swift --version 2>&1 | Out-String)
+          if (-not $swiftVersion.Contains("(swift-$($env:SWIFT_VERSION -replace '\.0$')-RELEASE)")) {
+            throw "Swift is not the pinned $env:SWIFT_VERSION release"
+          }
           & swift sdk list
           if ($LASTEXITCODE -ne 0) {
             throw "swift sdk list failed with $LASTEXITCODE"
@@ -282,8 +1808,6 @@ jobs:
             throw "Host Swift stdlib unusable (SDKROOT=$env:SDKROOT)"
           }
 
-          flutter config --no-analytics
-          flutter precache --ios
           dart pub get
           Push-Location packages/xcross
           dart run tool/build_xcross.dart
@@ -291,44 +1815,52 @@ jobs:
           Copy-Item -Recurse `
             packages/xcross/build/cli/windows_x64/bundle `
             "$env:RUNNER_TEMP\xcross-bundle"
-          & "$env:RUNNER_TEMP\xcross-bundle\bin\xcross.exe" setup
+          "$env:RUNNER_TEMP\xcross-bundle\bin" |
+            Out-File $env:GITHUB_PATH -Encoding utf8 -Append
 
-      - name: Test doctor on Windows
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          Push-Location packages/xcross
-          dart test test/cli/doctor_command_test.dart
-          Pop-Location
-          & "$env:RUNNER_TEMP\xcross-bundle\bin\xcross.exe" doctor --help
-          if ($LASTEXITCODE -ne 0) { throw 'doctor help failed' }
-
-      - name: Restore cached Darwin SDK
+      - name: Download Darwin SDK
         if: steps.darwin.outputs.available == 'true'
         uses: ./.github/actions/setup-darwin-sdk
 
-      - name: Build Flutter example on Linux
-        if: runner.os == 'Linux' && steps.darwin.outputs.available == 'true'
-        shell: bash
-        working-directory: examples/flutter_example
-        run: |
-          set -euo pipefail
-          "$RUNNER_TEMP/xcross-bundle/bin/xcross" --verbose flutter build
+      - name: Cache Gradle distribution and dependencies
+        if: steps.darwin.outputs.available == 'true'
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        with:
+          path: |
+            ${{ runner.temp }}/gradle/wrapper/dists
+            ${{ runner.temp }}/gradle/caches/modules-2
+          key: gradle-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('examples/compose_app/gradle/wrapper/gradle-wrapper.properties', 'examples/compose_app/**/*.gradle.kts', 'examples/compose_app/gradle.properties') }}
+          restore-keys: |
+            gradle-${{ runner.os }}-${{ runner.arch }}-
 
-      - name: Build Flutter example on Windows
-        if: runner.os == 'Windows' && steps.darwin.outputs.available == 'true'
-        shell: pwsh
-        working-directory: examples/flutter_example
-        run: |
-          $ErrorActionPreference = 'Stop'
-          & "$env:RUNNER_TEMP\xcross-bundle\bin\xcross.exe" --verbose flutter build
-          if ($LASTEXITCODE -ne 0) { throw 'flutter_example build failed' }
-
-      - name: Inspect Flutter example artifact on Linux
-        if: runner.os == 'Linux' && steps.darwin.outputs.available == 'true'
-        working-directory: examples/flutter_example
+      - name: Pre-download Gradle wrapper with retry
+        if: steps.darwin.outputs.available == 'true'
         shell: bash
+        working-directory: examples/compose_app
+        run: bash "$GITHUB_WORKSPACE/.github/scripts/prefetch_gradle_wrapper.sh"
+
+      - name: Set up Compose toolchain
+        if: steps.darwin.outputs.available == 'true'
+        shell: bash
+        working-directory: examples/compose_app
+        run: xcross compose setup --verbose
+
+      - name: Build Compose example
+        if: steps.darwin.outputs.available == 'true'
+        shell: bash
+        working-directory: examples/compose_app
+        run: xcross compose build --verbose
+
+      - name: Rebuild Compose example (up-to-date check)
+        if: steps.darwin.outputs.available == 'true'
+        shell: bash
+        working-directory: examples/compose_app
+        run: xcross compose build --verbose
+
+      - name: Inspect Compose example artifact
+        if: steps.darwin.outputs.available == 'true'
+        shell: bash
+        working-directory: examples/compose_app
         run: |
           set -euo pipefail
           shopt -s nullglob
@@ -337,35 +1869,208 @@ jobs:
             printf 'Expected one .app, found %s\n' "${#apps[@]}"
             exit 1
           fi
-          runner="${apps[0]}/Runner"
+          app="${apps[0]}"
+          test -f "$app/Info.plist"
+          runner="$app/Runner"
           test -f "$runner"
           llvm-readobj --file-headers "$runner" | tee runner-headers.txt
           grep -Eq 'Format: Mach-O arm64|Arch: aarch64' runner-headers.txt
-          llvm-objdump --macho --private-headers "$runner" |
-            grep -F '@executable_path/Frameworks'
+          if [[ -d "$app/Frameworks" ]]; then
+            for framework in "$app"/Frameworks/*.framework; do
+              name="$(basename "$framework" .framework)"
+              test -f "$framework/$name"
+              llvm-readobj --file-headers "$framework/$name" |
+                grep -Eq 'Format: Mach-O arm64|Arch: aarch64'
+            done
+            llvm-objdump --macho --private-headers "$runner" |
+              grep -F '@executable_path/Frameworks'
+          fi
+          if [[ -d "$app/compose-resources" ]]; then
+            test -d "$app/compose-resources/composeResources"
+          fi
+          ls -la "$app"
 
-      - name: Inspect Flutter example artifact on Windows
-        if: runner.os == 'Windows' && steps.darwin.outputs.available == 'true'
-        working-directory: examples/flutter_example
-        shell: pwsh
+  simulator-report:
+    name: Simulator report
+    # Waits on every test job so the report can list all failed jobs.
+    needs: [gate, flutter-build, flutter-simulator, flutter-example-simulator-run, compose-simulator, compose-build, native-host]
+    if: ${{ !cancelled() && needs.gate.outputs.trusted == 'true' }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      actions: read
+      issues: write
+      pull-requests: write
+    steps:
+      - name: Checkout report script
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          sparse-checkout: |
+            .github/scripts
+            .github/actions/simulator-report
+          persist-credentials: false
+
+      - name: Download staged simulator screenshots
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          pattern: simulator-report-*
+          path: ${{ runner.temp }}/simulator-report
+
+      - name: Link screenshots and write the run report
+        uses: ./.github/actions/simulator-report
+        with:
+          staged: ${{ runner.temp }}/simulator-report
+          title: Integration simulator report
+          sha: ${{ needs.gate.outputs.sha }}
+          pr: ${{ needs.gate.outputs.pr }}
+
+  native-host:
+    name: Native ARM64 host (${{ matrix.os }})
+    needs: gate
+    if: needs.gate.outputs.run == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04-arm, macos-15]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          ref: ${{ needs.gate.outputs.sha }}
+          persist-credentials: false
+
+      - name: Update example submodule
+        shell: bash
+        run: git submodule update --init --checkout examples
+
+      - name: Verify native ARM64 host and JDK 21
+        shell: bash
         run: |
-          $ErrorActionPreference = 'Stop'
-          $apps = @(Get-ChildItem build/xcross-ios -Directory -Filter *.app)
-          if ($apps.Count -ne 1) {
-            throw "Expected one .app, found $($apps.Count)"
-          }
-          $runner = Join-Path $apps[0].FullName 'Runner'
-          if (-not (Test-Path $runner -PathType Leaf)) {
-            throw "Missing $runner"
-          }
-          $headers = (& llvm-readobj --file-headers $runner | Out-String)
-          if ($LASTEXITCODE -ne 0 -or
-              ($headers -notmatch 'Format:\s+Mach-O arm64' -and
-               $headers -notmatch 'Arch:\s+aarch64')) {
-            throw "Runner is not ARM64 Mach-O:`n$headers"
-          }
-          $commands = (& llvm-objdump --macho --private-headers $runner | Out-String)
-          if ($LASTEXITCODE -ne 0 -or
-              $commands -notmatch '@executable_path/Frameworks') {
-            throw "Missing Frameworks rpath:`n$commands"
-          }
+          set -euo pipefail
+          test "$RUNNER_ARCH" = ARM64
+          case "$(uname -m)" in
+            aarch64|arm64) ;;
+            *) echo 'Expected a native ARM64 host'; exit 1 ;;
+          esac
+          jdk="${JAVA_HOME_21_ARM64:-${JAVA_HOME_21_arm64:-${JAVA_HOME_21_X64:-}}}"
+          test -n "$jdk"
+          echo "JAVA_HOME=$jdk" >> "$GITHUB_ENV"
+          echo "$jdk/bin" >> "$GITHUB_PATH"
+          "$jdk/bin/java" -XshowSettings:properties -version 2>&1 |
+            tee "$RUNNER_TEMP/java-properties.txt"
+          grep -Eq 'os.arch = (aarch64|arm64)' "$RUNNER_TEMP/java-properties.txt"
+          grep -Eq 'java.specification.version = 21$' "$RUNNER_TEMP/java-properties.txt"
+          cc --version
+
+      - name: Set up native Dart
+        uses: dart-lang/setup-dart@65eb853c7ba17dde3be364c3d2858773e7144260
+        with:
+          sdk: stable
+          architecture: arm64
+
+      - name: Resolve dependencies
+        run: dart pub get
+
+      - name: Build and test native ADI bridge
+        working-directory: packages/apple_developer_kit
+        run: dart run test/adi/posix_bridge_test.dart
+
+      - name: Test xcross host workflows
+        working-directory: packages/xcross
+        run: dart test
+
+      - name: Test Apple developer kit and native ADI bridge
+        working-directory: packages/apple_developer_kit
+        run: dart test
+
+      - name: Test shared packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          dart test packages/cli_kit
+          dart test packages/darwin_sdk_kit
+          dart test packages/dart_mobile_device
+          dart test packages/frontend_server_kit
+
+      - name: Smoke-test isolated real ARM64 ADI libraries
+        working-directory: packages/apple_developer_kit
+        env:
+          ADI_NATIVE_SMOKE: '1'
+        run: dart test --compiler cli test/adi/adi_client_test.dart test/adi/posix_bridge_test.dart
+
+      - name: Build native CLI bundle
+        working-directory: packages/xcross
+        run: dart run tool/build_xcross.dart
+
+      - name: Smoke-test native CLI bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          bundles=(packages/xcross/build/cli/*/bundle)
+          test "${#bundles[@]}" -eq 1
+          bundle="${bundles[0]}"
+          for executable in xcross xcrun; do
+            test -x "$bundle/bin/$executable"
+            file "$bundle/bin/$executable" | tee "$RUNNER_TEMP/$executable-file.txt"
+            grep -Eq 'aarch64|arm64' "$RUNNER_TEMP/$executable-file.txt"
+          done
+          "$bundle/bin/xcross" --help
+          if [[ "$RUNNER_OS" == Linux ]]; then
+            "$bundle/bin/xcrun" --version
+          fi
+
+  verdict:
+    name: Verdict
+    needs: [gate, flutter-build, flutter-aot-reference, flutter-aot-parity, flutter-aot-run, flutter-simulator, flutter-example-simulator-run, native-host, simulator-report]
+    if: ${{ always() && needs.gate.outputs.run == 'true' && needs.gate.outputs.trusted == 'true' }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      statuses: write
+    steps:
+      - name: Checkout status action
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          sparse-checkout: .github/actions/commit-status
+          persist-credentials: false
+
+      - name: Report the commit status
+        uses: ./.github/actions/commit-status
+        with:
+          sha: ${{ needs.gate.outputs.sha }}
+          context: Integration Tests
+          state: ${{ (contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')) && 'failure' || 'success' }}
+
+      - name: Fail when a required job failed
+        if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
+        run: exit 1
+
+  compose-verdict:
+    name: Compose verdict
+    needs: [gate, compose-build, compose-simulator, simulator-report]
+    if: ${{ always() && needs.gate.outputs.run == 'true' && needs.gate.outputs.trusted == 'true' }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      statuses: write
+    steps:
+      - name: Checkout status action
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          sparse-checkout: .github/actions/commit-status
+          persist-credentials: false
+
+      - name: Report the commit status
+        uses: ./.github/actions/commit-status
+        with:
+          sha: ${{ needs.gate.outputs.sha }}
+          context: Compose Integration Tests
+          state: ${{ (contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')) && 'failure' || 'success' }}
+
+      - name: Fail when a required job failed
+        if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
+        run: exit 1

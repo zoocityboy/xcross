@@ -1,9 +1,246 @@
 import 'dart:io';
 
-import 'package:dart_mobile_device/src/pymd/pymd.dart';
+import 'package:cli_kit/host/macos/macos_host.dart';
+import 'package:cli_kit/host/shared/posix_privileges.dart';
+import 'package:cli_kit/shared/platform/platform_host.dart';
+import 'package:cli_kit/shared/process/process.dart';
+import 'package:cli_kit/shared/process/process_models.dart';
+import 'package:dart_mobile_device/host/macos/macos_device_host.dart';
+import 'package:dart_mobile_device/src/target/iphone/device/pymd/pymd_launch_command.dart';
+import 'package:dart_mobile_device/target/iphone/device/pymd/pymd.dart';
+import 'package:meta/meta.dart';
 import 'package:test/test.dart';
 
+import 'test_log_output.dart';
+import 'wireless_device_preparation_test.dart';
+
 void main() {
+  group('PymdLaunchCommand.encode', () {
+    const cases = {
+      'plain': 'plain',
+      '': "''",
+      'two words': "'two words'",
+      'a\tb': "'a\tb'",
+      'a\nb': "'a\nb'",
+      'a\rb': "'a\rb'",
+      "it's": r"'it'\''s'",
+      '"quoted"': "'\"quoted\"'",
+      r'C:\path\file': r"'C:\path\file'",
+      r'$HOME': r"'$HOME'",
+      '`literal`': "'`literal`'",
+      'a;&|<>*?()': 'a;&|<>*?()',
+      '你好': '你好',
+    };
+    for (final entry in cases.entries) {
+      test('preserves shlex protocol for ${entry.key.codeUnits}', () {
+        expect(
+          PymdLaunchCommand.encode('com.example.app', [entry.key]),
+          'com.example.app ${entry.value}',
+        );
+      });
+    }
+    test('encodes the bundle identifier by the same protocol', () {
+      expect(PymdLaunchCommand.encode('app name', []), "'app name'");
+      expect(PymdLaunchCommand.encode('', []), "''");
+    });
+  });
+
+  test('launchSuspended passes one shlex command after the separator', () async {
+    final processes = PymdLaunchProcesses();
+    final host = MacOSHost(processes: processes);
+    final runner = ProcessRunner(
+      host,
+      configuration: ProcessConfiguration(
+        normalizedTools: const {'pymobiledevice3': '/fixture/pymd'},
+        effectiveChildEnvironment: const {
+          'USBMUXD_SOCKET_ADDRESS': 'fixture-usbmux',
+        },
+      ),
+      log: testLog(),
+      stdinStream: const Stream.empty(),
+      stdoutSink: testSink(),
+      stderrSink: testSink(),
+    );
+    final pymd = Pymd(
+      runner,
+      console: TestDeviceConsole(),
+      localHttp: testLocalHttp(),
+      privileges: PosixPrivileges(runner),
+      hostPolicy: MacOSDeviceHost(runner),
+    );
+    final pid = await pymd.launchSuspended(
+      deviceArgs: ['--rsd', 'fd00::1', '1234'],
+      bundleId: 'com.example.app',
+      appArguments: ['', 'two words', "it's", '"quoted"', r'C:\path', r'$HOME'],
+    );
+    expect(pid, 12345);
+    expect(processes.arguments, [
+      'developer',
+      'dvt',
+      'launch',
+      '--rsd',
+      'fd00::1',
+      '1234',
+      '--suspended',
+      '--kill-existing',
+      '--',
+      r"""com.example.app '' 'two words' 'it'\''s' '"quoted"' 'C:\path' '$HOME'""",
+    ]);
+  });
+
+  final runner = ProcessRunner(
+    stdinStream: const Stream.empty(),
+    stdoutSink: testSink(),
+    stderrSink: testSink(),
+    MacOSHost(environment: Platform.environment),
+    log: testLog(),
+  );
+  final pymd = Pymd(
+    console: TestDeviceConsole(),
+    localHttp: testLocalHttp(),
+    runner,
+    privileges: PosixPrivileges(runner),
+    hostPolicy: MacOSDeviceHost(runner),
+  );
+  test(
+    testOn: '!windows',
+    'ensureInstalled prefers binary wheels for every pip attempt',
+    () async {
+      final bin = Directory.systemTemp.createTempSync('pymd_install');
+      addTearDown(() => bin.deleteSync(recursive: true));
+      final python = File('${bin.path}/python3')..writeAsStringSync('');
+      final processes = PymdInstallProcesses(python.path);
+      final env = {'PATH': bin.path, 'HOME': bin.path};
+      final host = MacOSHost(environment: env, processes: processes);
+      final runner = ProcessRunner(
+        host,
+        configuration: ProcessConfiguration(
+          normalizedTools: const {},
+          effectiveChildEnvironment: env,
+        ),
+        log: testLog(),
+        stdinStream: const Stream.empty(),
+        stdoutSink: testSink(),
+        stderrSink: testSink(),
+      );
+      final pymd = Pymd(
+        runner,
+        console: TestDeviceConsole(),
+        localHttp: testLocalHttp(),
+        privileges: PosixPrivileges(runner),
+        hostPolicy: MacOSDeviceHost(runner),
+      );
+      expect(await pymd.ensureInstalled(), isTrue);
+      expect(processes.installs, isNotEmpty);
+      for (final install in processes.installs) {
+        expect(install.take(4), ['-m', 'pip', 'install', '--prefer-binary']);
+        expect(install, contains('pymobiledevice3'));
+      }
+    },
+  );
+
+  group('Pymd.tunneldInvocation', testOn: '!windows', () {
+    late Directory root;
+    setUp(() => root = Directory.systemTemp.createTempSync('pymd_tunneld'));
+    tearDown(() => root.deleteSync(recursive: true));
+
+    File touch(String path, [String content = '']) => File('${root.path}/$path')
+      ..createSync(recursive: true)
+      ..writeAsStringSync(content);
+
+    Pymd pymdFor(Set<String> modern) {
+      final env = {'PATH': '${root.path}/usr/bin', 'HOME': '${root.path}/home'};
+      final runner = ProcessRunner(
+        MacOSHost(environment: env, processes: PymdProbeProcesses(modern)),
+        configuration: ProcessConfiguration(
+          normalizedTools: const {},
+          effectiveChildEnvironment: env,
+        ),
+        log: testLog(),
+        stdinStream: const Stream.empty(),
+        stdoutSink: testSink(),
+        stderrSink: testSink(),
+      );
+      return Pymd(
+        runner,
+        console: TestDeviceConsole(),
+        localHttp: testLocalHttp(),
+        privileges: PosixPrivileges(runner),
+        hostPolicy: MacOSDeviceHost(runner),
+      );
+    }
+
+    test('finds the python of a pipx venv behind the CLI symlink', () async {
+      final system = touch('usr/bin/python3');
+      final venvBin = '${root.path}/home/.local/share/pipx/venvs/pmd3/bin';
+      final venvPython = touch('home/.local/share/pipx/venvs/pmd3/bin/python');
+      final cli = touch(
+        'home/.local/share/pipx/venvs/pmd3/bin/pymobiledevice3',
+        '#!$venvBin/python\n',
+      );
+      Directory('${root.path}/home/.local/bin').createSync(recursive: true);
+      Link('${root.path}/home/.local/bin/pymobiledevice3').createSync(cli.path);
+      final pymd = pymdFor({venvPython.path});
+
+      final tunneld = await pymd.tunneldInvocation();
+
+      expect(tunneld.modernPython, isTrue);
+      expect(tunneld.invocation.executable, venvPython.path);
+      expect(tunneld.invocation.prefixArgs, ['-m', 'pymobiledevice3']);
+      expect(system.path, isNot(tunneld.invocation.executable));
+    });
+
+    test('finds the shebang interpreter of a non-venv CLI', () async {
+      touch('usr/bin/python3');
+      final python = touch('opt/py313/bin/python3.13');
+      touch('usr/bin/pymobiledevice3', '#!${python.path} -E\n');
+      final pymd = pymdFor({python.path});
+
+      final tunneld = await pymd.tunneldInvocation();
+
+      expect(tunneld.modernPython, isTrue);
+      expect(tunneld.invocation.executable, python.path);
+    });
+
+    test('never probes a non-python shebang interpreter', () async {
+      final processes = PymdProbeProcesses({});
+      touch('usr/bin/pymobiledevice3', "#!/bin/sh\n'''exec' python3 \"\$0\"\n");
+      final env = {'PATH': '${root.path}/usr/bin', 'HOME': root.path};
+      final runner = ProcessRunner(
+        MacOSHost(environment: env, processes: processes),
+        configuration: ProcessConfiguration(
+          normalizedTools: const {},
+          effectiveChildEnvironment: env,
+        ),
+        log: testLog(),
+        stdinStream: const Stream.empty(),
+        stdoutSink: testSink(),
+        stderrSink: testSink(),
+      );
+      final pymd = Pymd(
+        runner,
+        console: TestDeviceConsole(),
+        localHttp: testLocalHttp(),
+        privileges: PosixPrivileges(runner),
+        hostPolicy: MacOSDeviceHost(runner),
+      );
+
+      expect((await pymd.tunneldInvocation()).modernPython, isFalse);
+      expect(processes.started, isNot(contains('/bin/sh')));
+    });
+
+    test('reports no modern python when the CLI interpreter is old', () async {
+      touch('usr/bin/python3');
+      final cli = touch('usr/bin/pymobiledevice3', '#!/usr/bin/env python3\n');
+      final pymd = pymdFor({});
+
+      final tunneld = await pymd.tunneldInvocation();
+
+      expect(tunneld.modernPython, isFalse);
+      expect(tunneld.invocation.executable, cli.path);
+    });
+  });
+
   group('Pymd.asPort', () {
     test('passes through an int unchanged', () {
       expect(Pymd.asPort(12345), 12345);
@@ -32,7 +269,7 @@ void main() {
 
   group('Pymd.usbmuxEnvironment', () {
     test('is a superset of Platform.environment', () {
-      final env = Pymd.usbmuxEnvironment();
+      final env = pymd.usbmuxEnvironment();
       for (final entry in Platform.environment.entries) {
         expect(env[entry.key], entry.value);
       }
@@ -49,7 +286,7 @@ void main() {
     test('honours USBMUXD_SOCKET_ADDRESS when set, else mirrors '
         '/var/run/usbmuxd existence', () {
       final envValue = Platform.environment['USBMUXD_SOCKET_ADDRESS'];
-      final result = Pymd.resolvedUsbmuxAddress();
+      final result = pymd.resolvedUsbmuxAddress();
 
       if (envValue != null && envValue.isNotEmpty) {
         expect(result, envValue);
@@ -59,4 +296,91 @@ void main() {
       }
     });
   });
+}
+
+@internal
+final class PymdInstallProcesses implements HostProcessInterface {
+  PymdInstallProcesses(this.python);
+  final String python;
+  final installs = <List<String>>[];
+
+  @override
+  Future<Process> start(
+    String executable,
+    List<String> arguments, {
+    String? workingDirectory,
+    Map<String, String>? environment,
+    bool includeParentEnvironment = true,
+    bool runInShell = false,
+    ProcessStartMode mode = ProcessStartMode.normal,
+  }) async {
+    expect(executable, python);
+    final process = WirelessChild();
+    if (arguments.take(3).join(' ') == '-m pip install') {
+      installs.add(List.of(arguments));
+      process.exited.complete(0);
+    } else {
+      process.exited.complete(installs.isEmpty ? 1 : 0);
+    }
+    return process;
+  }
+
+  @override
+  dynamic noSuchMethod(Invocation invocation) =>
+      throw StateError('unexpected native process operation');
+}
+
+@internal
+final class PymdProbeProcesses implements HostProcessInterface {
+  PymdProbeProcesses(this.modern);
+  final Set<String> modern;
+  final started = <String>[];
+
+  @override
+  Future<Process> start(
+    String executable,
+    List<String> arguments, {
+    String? workingDirectory,
+    Map<String, String>? environment,
+    bool includeParentEnvironment = true,
+    bool runInShell = false,
+    ProcessStartMode mode = ProcessStartMode.normal,
+  }) async {
+    started.add(executable);
+    final ok = modern.contains(executable) && arguments.first == '-c';
+    final process = WirelessChild(body: ok ? executable : '');
+    process.exited.complete(ok ? 0 : 1);
+    return process;
+  }
+
+  @override
+  dynamic noSuchMethod(Invocation invocation) =>
+      throw StateError('unexpected native process operation');
+}
+
+@internal
+final class PymdLaunchProcesses implements HostProcessInterface {
+  List<String>? arguments;
+
+  @override
+  Future<Process> start(
+    String executable,
+    List<String> arguments, {
+    String? workingDirectory,
+    Map<String, String>? environment,
+    bool includeParentEnvironment = true,
+    bool runInShell = false,
+    ProcessStartMode mode = ProcessStartMode.normal,
+  }) async {
+    expect(executable, '/fixture/pymd');
+    expect(runInShell, isFalse);
+    this.arguments = List.of(arguments);
+    final process = WirelessChild(body: 'Process launched with pid 12345');
+    process.exited.complete(0);
+    return process;
+  }
+
+  @override
+  dynamic noSuchMethod(Invocation invocation) =>
+      throw StateError('unexpected native process operation');
 }

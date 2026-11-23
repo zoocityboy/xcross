@@ -1,23 +1,23 @@
 import 'dart:io';
 
-import 'package:apple_developer_kit/src/apple_http_client.dart';
-import 'package:apple_developer_kit/src/errors.dart';
-import 'package:apple_developer_kit/src/grandslam/anisette/anisette_headers.dart';
-import 'package:apple_developer_kit/src/grandslam/anisette/grandslam_endpoints.dart';
-import 'package:apple_developer_kit/src/grandslam/grandslam_operation.dart';
+import 'package:apple_developer_kit/shared/errors/errors.dart';
+import 'package:apple_developer_kit/shared/grandslam/anisette/grandslam_endpoints.dart';
+import 'package:apple_developer_kit/src/shared/grandslam/anisette/anisette_headers.dart';
+import 'package:apple_developer_kit/src/shared/grandslam/grandslam_operation.dart';
+import 'package:apple_developer_kit/src/shared/http/apple_http_client.dart';
 import 'package:http/http.dart' as http;
 import 'package:http/testing.dart';
 import 'package:test/test.dart';
 
 void main() {
   for (final operation in ['init', 'complete', 'apptokens']) {
-    test('$operation sends akd on the actual GSA request', () async {
+    test('$operation sends Android client-info on the actual GSA request', () async {
       final client = MockClient((request) async {
         expect(request.persistentConnection, isFalse);
         expect(request.headers['X-MMe-Client-Info'], anisetteClientInfo);
         expect(
           request.headers['X-MMe-Client-Info'],
-          contains('com.apple.akd/1.0'),
+          contains('com.apple.android.music/4.9.6'),
         );
         expect(
           request.headers['X-MMe-Client-Info'],
@@ -38,6 +38,7 @@ void main() {
                 machineIdentifier: 'mid',
                 routingInfo: '123',
                 localUserUid: 'test-device',
+                localeName: 'en_US',
               ),
           extraParams: const {},
         ),
@@ -54,7 +55,7 @@ void main() {
         http.Response(
           '<html>private response</html>',
           429,
-          headers: {if (retryAfter != null) 'retry-after': retryAfter},
+          headers: {'retry-after': ?retryAfter},
         ),
         operation: 'test operation',
         now: now,

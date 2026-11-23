@@ -1,11 +1,16 @@
 import 'dart:io';
 
+import 'package:cli_kit/host/linux/linux_host.dart';
+
 import 'package:test/test.dart';
-import 'package:xcross/src/cli/basic/internal/clang_requirement.dart';
+import 'package:xcross/src/shared/cli/basic/internal/clang_requirement.dart';
+import 'host_ops_residual_fixtures.dart';
 
 void main() {
   for (final suffix in ['.exe', '.EXE']) {
     test(
+      testOn: '!windows',
+
       'uses resolved Windows executable suffix $suffix for clang++',
       () async {
         final dir = await Directory.systemTemp.createTemp('xcross-clang-');
@@ -14,7 +19,7 @@ void main() {
           File(executable).createSync();
           File('${dir.path}/clang++$suffix').createSync();
           expect(
-            await ClangRequirement.resolve(
+            await _resolveClang(
               directories: [dir.path],
               lookup: (name, _) async => name == 'clang' ? executable : null,
               version: (_) async => 'clang version 22.1.8',
@@ -33,35 +38,44 @@ void main() {
     expect(ClangRequirement.majorVersion('LLVM version 21'), isNull);
   });
 
-  test('finds versioned clang when the default on PATH is too old', () async {
-    final dir = await Directory.systemTemp.createTemp('xcross-clang-');
-    try {
-      for (final name in ['clang-21', 'clang++-21', 'clang-19', 'clang++-19']) {
-        File('${dir.path}/$name').createSync();
+  test(
+    testOn: '!windows',
+    'finds versioned clang when the default on PATH is too old',
+    () async {
+      final dir = await Directory.systemTemp.createTemp('xcross-clang-');
+      try {
+        for (final name in [
+          'clang-21',
+          'clang++-21',
+          'clang-19',
+          'clang++-19',
+        ]) {
+          File('${dir.path}/$name').createSync();
+        }
+        final result = await _resolveClang(
+          directories: [dir.path],
+          lookup: (name, _) async => name == 'clang'
+              ? '${dir.path}/clang'
+              : File('${dir.path}/$name').existsSync()
+              ? '${dir.path}/$name'
+              : null,
+          version: (path) async => path.endsWith('-21')
+              ? 'clang version 21.0.0'
+              : 'clang version 19.0.0',
+        );
+        expect(result, '${dir.path}/clang-21');
+      } finally {
+        await dir.delete(recursive: true);
       }
-      final result = await ClangRequirement.resolve(
-        directories: [dir.path],
-        lookup: (name, _) async => name == 'clang'
-            ? '${dir.path}/clang'
-            : File('${dir.path}/$name').existsSync()
-            ? '${dir.path}/$name'
-            : null,
-        version: (path) async => path.endsWith('-21')
-            ? 'clang version 21.0.0'
-            : 'clang version 19.0.0',
-      );
-      expect(result, '${dir.path}/clang-21');
-    } finally {
-      await dir.delete(recursive: true);
-    }
-  });
+    },
+  );
 
   test('rejects old clang and a versioned clang without clang++', () async {
     final dir = await Directory.systemTemp.createTemp('xcross-clang-');
     try {
       File('${dir.path}/clang-20').createSync();
       expect(
-        await ClangRequirement.resolve(
+        await _resolveClang(
           directories: [dir.path],
           lookup: (name, _) async => File('${dir.path}/$name').existsSync()
               ? '${dir.path}/$name'
@@ -74,4 +88,19 @@ void main() {
       await dir.delete(recursive: true);
     }
   });
+}
+
+Future<String?> _resolveClang({
+  required List<String> directories,
+  required Future<String?> Function(String, List<String>) lookup,
+  required Future<String> Function(String) version,
+}) {
+  final host = residualProcessHost(
+    LinuxHost(),
+    (executable, _, _) async =>
+        ResidualChild(output: await version(executable)),
+  );
+  return ClangRequirement(
+    residualRunner(host, lookup: lookup),
+  ).resolve(directories: directories);
 }

@@ -1,0 +1,104 @@
+name: Simulator report
+description: >-
+  Write one run summary for every Flutter and Compose simulator smoke, linking
+  each screenshot to its unzipped, expiring Actions artifact, and list every
+  failed job with a link to its log. Nothing is written to the repository.
+
+inputs:
+  staged:
+    description: Directory holding the downloaded simulator-report-* artifacts.
+    required: true
+  title:
+    description: Summary heading.
+    required: true
+  pr:
+    description: Pull request to post the report on; earlier reports there are marked outdated.
+    required: false
+    default: ''
+  sha:
+    description: xcross commit the run checked out.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: List this run's screenshot artifacts
+      id: artifacts
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        set -euo pipefail
+        list="$RUNNER_TEMP/simulator-artifacts.json"
+        if gh api --paginate --slurp "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/artifacts?per_page=100" \
+            | jq '[.[].artifacts[]]' > "$list"; then
+          echo "list=$list" >> "$GITHUB_OUTPUT"
+        else
+          echo "::warning::Could not list simulator screenshot artifacts"
+        fi
+
+    - name: List this run's jobs
+      id: jobs
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        set -euo pipefail
+        list="$RUNNER_TEMP/run-jobs.json"
+        if gh api --paginate --slurp "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/jobs?filter=latest&per_page=100" \
+            | jq '[.[].jobs[]]' > "$list"; then
+          echo "list=$list" >> "$GITHUB_OUTPUT"
+        else
+          echo "::warning::Could not list this run's jobs"
+        fi
+
+    - name: Resolve the xcross_examples commit
+      id: examples
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        SHA: ${{ inputs.sha }}
+      run: |
+        set -euo pipefail
+        if submodule=$(gh api "repos/${GITHUB_REPOSITORY}/contents/examples?ref=${SHA}"); then
+          echo "sha=$(jq -r '.sha // empty' <<< "$submodule")" >> "$GITHUB_OUTPUT"
+          echo "url=$(jq -r '.submodule_git_url // empty' <<< "$submodule")" >> "$GITHUB_OUTPUT"
+        else
+          echo "::warning::Could not resolve the examples submodule commit"
+        fi
+
+    - name: Write run summary
+      shell: bash
+      env:
+        STAGED: ${{ inputs.staged }}
+        TITLE: ${{ inputs.title }}
+        ARTIFACTS: ${{ steps.artifacts.outputs.list }}
+        JOBS: ${{ steps.jobs.outputs.list }}
+        SHA: ${{ inputs.sha }}
+        REPOSITORY_URL: ${{ github.server_url }}/${{ github.repository }}
+        EXAMPLES_SHA: ${{ steps.examples.outputs.sha }}
+        EXAMPLES_URL: ${{ steps.examples.outputs.url }}
+      run: |
+        set -euo pipefail
+        args=(--title "$TITLE" --commit "$SHA" --repository-url "$REPOSITORY_URL"
+          --examples-commit "$EXAMPLES_SHA" --examples-url "$EXAMPLES_URL" --run-id "$GITHUB_RUN_ID")
+        if [ -n "$ARTIFACTS" ]; then
+          args+=(--artifacts "$ARTIFACTS")
+        fi
+        if [ -n "$JOBS" ]; then
+          args+=(--jobs "$JOBS")
+        fi
+        python3 .github/scripts/simulator_report.py "$STAGED" "${args[@]}" > "$RUNNER_TEMP/simulator-report.md"
+
+    - name: Post report on the pull request
+      if: inputs.pr != ''
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        PR: ${{ inputs.pr }}
+        RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      run: |
+        set -euo pipefail
+        { cat "$RUNNER_TEMP/simulator-report.md"; echo; echo "[Full run]($RUN_URL)"; } > "$RUNNER_TEMP/simulator-comment.md"
+        python3 .github/scripts/report_comment.py --repository "$GITHUB_REPOSITORY" --pr "$PR" \
+          --body-file "$RUNNER_TEMP/simulator-comment.md"

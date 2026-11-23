@@ -1,0 +1,376 @@
+import 'package:cli_kit/shared/platform/platform_host.dart';
+import 'package:meta/meta.dart';
+import 'package:xcross/src/composition/flutter/ios_gen_snapshot.dart';
+import 'package:xcross/src/composition/ios_target.dart';
+import 'package:xcross/src/shared/cli/basic/doctor_environment_checks.dart';
+import 'package:xcross/src/shared/cli/basic/doctor_models.dart';
+import 'package:xcross/src/shared/compose/kmp_project_detector.dart';
+import 'package:xcross/src/shared/compose/project/kmp_project.dart';
+import 'package:xcross/src/shared/compose/swift/swift_host_paths.dart';
+import 'package:xcross/src/shared/compose/swift/swift_import_check.dart';
+import 'package:xcross/src/shared/compose/swiftpm/host_package_link.dart';
+import 'package:xcross/src/shared/compose/swiftpm/host_swift_packages_reader.dart';
+import 'package:xcross/src/shared/compose/swiftpm/swift_package_model.dart';
+import 'package:xcross/src/shared/compose/toolchain/compose_toolchain_resolver.dart';
+import 'package:xcross/src/shared/flutter/gen_snapshot/ios_gen_snapshot_mode.dart';
+import 'package:xcross/src/shared/flutter/gen_snapshot/ios_gen_snapshot_resolver.dart';
+import 'package:xcross/src/shared/flutter/models/flutter/flutter_build_mode.dart';
+import 'package:xcross/src/shared/packages/package_config_resolver.dart';
+import 'package:xcross/src/shared/runtime/xcross_runtime.dart';
+import 'package:xcross/src/target/shared/runtime/build_features.dart';
+
+/// The read-only checks behind `xcross flutter doctor` and
+/// `xcross compose doctor`, grouped so each framework examines only what its
+/// own build and run actually need.
+@internal
+final class DoctorSections<T extends PlatformHostInterface> {
+  DoctorSections(this.runtime, {required this.environment, String? projectRoot})
+    : projectRoot = projectRoot ?? runtime.host.paths.context.current,
+      features = composePhysicalFeatures(runtime),
+      packageConfigs = PackageConfigResolver(
+        fileSystem: runtime.host.fileSystem,
+        paths: runtime.host.paths.context,
+      );
+
+  final XcrossRuntime<T> runtime;
+  final DoctorEnvironmentChecks<T> environment;
+  final String projectRoot;
+  final XcrossBuildFeatures<T> features;
+  final PackageConfigResolver packageConfigs;
+
+  List<DoctorSection> get flutter => [
+    DoctorSection('Flutter project', flutterProject),
+    DoctorSection('iOS toolchain', environment.flutterToolchain),
+    DoctorSection('Deployment', environment.deployment),
+  ];
+
+  List<DoctorSection> get compose => [
+    DoctorSection('Compose project', composeProject),
+    DoctorSection('Compose toolchain', composeToolchain),
+    DoctorSection('Deployment', environment.deployment),
+  ];
+
+  bool _exists(String name) => runtime.host.fileSystem
+      .file(runtime.host.paths.context.join(projectRoot, name))
+      .existsSync();
+
+  /// The Flutter SDK is checked even outside a project: it is the one
+  /// project-level requirement that does not depend on having one.
+  Future<List<DoctorCheck>> flutterProject() async {
+    if (!_exists('pubspec.yaml')) {
+      return [
+        const DoctorCheck.warning(
+          'Project',
+          'No pubspec.yaml in the current directory.',
+        ),
+        await _flutterSdk(),
+      ];
+    }
+    final project = _flutterPubspec();
+    if (project.status == DoctorStatus.failure) {
+      return [project, await _flutterSdk()];
+    }
+    return [
+      project,
+      _flutterEntrypoint(),
+      await _flutterSdk(),
+      await _flutterPackages(),
+      ...await _aotCompilers(),
+    ];
+  }
+
+  /// Whether release and profile builds will find an iOS AOT compiler.
+  ///
+  /// Debug builds never need one, so a missing compiler is a warning, and a
+  /// failed network check is reported without failing the doctor.
+  Future<List<DoctorCheck>> _aotCompilers() async {
+    final String flutterRoot;
+    try {
+      flutterRoot = await features.flutterRuntime.resolveFlutterRoot(
+        projectRoot: projectRoot,
+      );
+    } on Object {
+      return const [];
+    }
+    final resolver = composeIosGenSnapshotResolver(
+      runner: runtime.runner,
+      downloader: runtime.downloader,
+      createHttpClient: runtime.createHttpClient,
+      config: runtime.config,
+    );
+    final checks = <DoctorCheck>[];
+    for (final mode in IosGenSnapshotMode.values) {
+      final label = 'AOT compiler (${mode.name})';
+      final IosGenSnapshotAvailability found;
+      try {
+        found = await resolver.availability(
+          flutterRoot: flutterRoot,
+          engineDirectory: features.flutterRuntime
+              .engineCache(flutterRoot, mode: FlutterBuildMode.of(mode))
+              .engineDirectory,
+          mode: mode,
+        );
+      } on Object catch (error) {
+        checks.add(DoctorCheck.warning(label, '$error'));
+        continue;
+      }
+      checks.add(switch (found.source) {
+        IosGenSnapshotSource.flutterSdk => DoctorCheck.success(
+          label,
+          'Shipped with the Flutter engine',
+          path: found.path,
+        ),
+        IosGenSnapshotSource.cache => DoctorCheck.success(
+          label,
+          'Cached',
+          path: found.path,
+        ),
+        IosGenSnapshotSource.pinned => DoctorCheck.success(
+          label,
+          'Pinned in xcross config',
+          path: found.path,
+        ),
+        IosGenSnapshotSource.download => DoctorCheck.success(
+          label,
+          'Published; downloaded on the first build '
+          '(`xcross flutter precache` fetches it now)',
+        ),
+        null => DoctorCheck.warning(
+          label,
+          '${found.detail ?? 'Unavailable'}'
+          '${found.unknown ? '' : ' Debug builds are unaffected.'}',
+        ),
+      });
+    }
+    return checks;
+  }
+
+  DoctorCheck _flutterPubspec() {
+    try {
+      return DoctorCheck.success(
+        'Project',
+        features.flutterRuntime.pubspecs.loadSync(projectRoot).name,
+      );
+    } on Object catch (error) {
+      return DoctorCheck.failure('Project', '$error');
+    }
+  }
+
+  DoctorCheck _flutterEntrypoint() {
+    final entrypoint = runtime.host.fileSystem.file(
+      runtime.host.paths.context.join(projectRoot, 'lib', 'main.dart'),
+    );
+    return entrypoint.existsSync()
+        ? DoctorCheck.success('Entrypoint', 'Found', path: entrypoint.path)
+        : const DoctorCheck.failure(
+            'Entrypoint',
+            'lib/main.dart does not exist.',
+          );
+  }
+
+  Future<DoctorCheck> _flutterSdk() async {
+    try {
+      final flutterRoot = await features.flutterRuntime.resolveFlutterRoot(
+        projectRoot: projectRoot,
+      );
+      return DoctorCheck.success('Flutter SDK', 'Found', path: flutterRoot);
+    } on Object catch (error) {
+      return DoctorCheck.failure('Flutter SDK', '$error');
+    }
+  }
+
+  Future<DoctorCheck> _flutterPackages() async {
+    final packageConfig = await packageConfigs.find(projectRoot);
+    return packageConfig == null
+        ? const DoctorCheck.warning(
+            'Packages',
+            'No package_config.json; `flutter pub get` will be required.',
+          )
+        : DoctorCheck.success('Packages', 'Resolved', path: packageConfig);
+  }
+
+  Future<List<DoctorCheck>> composeProject() async {
+    if (!_exists('settings.gradle.kts') && !_exists('settings.gradle')) {
+      return const [
+        DoctorCheck.warning(
+          'Project',
+          'No settings.gradle.kts or settings.gradle in the current '
+              'directory.',
+        ),
+      ];
+    }
+    try {
+      final project = KmpProjectDetector(
+        files: runtime.host.fileSystem,
+        log: runtime.log,
+        root: projectRoot,
+      ).detect();
+      return [
+        DoctorCheck.success('Project', project.moduleName),
+        if (project.entryKind == KmpEntryKind.swiftApp) _swiftImports(project),
+      ];
+    } on Object catch (error) {
+      return [DoctorCheck.failure('Project', '$error')];
+    }
+  }
+
+  /// Whether the Swift sources import only modules the installed Darwin SDK
+  /// provides. Read-only: a missing SDK is a warning, since the `Darwin SDK`
+  /// row already reports it.
+  DoctorCheck _swiftImports(KmpProject project) {
+    const name = 'Swift imports';
+    final String sdkPath;
+    final String bundle;
+    final repository = environment.repository;
+    final platform = environment.buildPlatform;
+    try {
+      final sdk = repository.current();
+      if (sdk == null) throw StateError('Darwin SDK is not installed.');
+      sdkPath = repository.iosSdk(sdk, target: platform);
+      bundle = sdk.swiftSdkPath;
+    } on Object {
+      return const DoctorCheck.warning(
+        name,
+        'Not checked: the Darwin SDK is not installed '
+        '(see the Darwin SDK row).',
+      );
+    }
+    final List<UnresolvedSwiftImport> missing;
+    final HostSwiftPackages declared;
+    try {
+      declared = readHostSwiftPackages(
+        files: runtime.host.fileSystem,
+        paths: runtime.host.paths.context,
+        iosAppDir: runtime.host.paths.context.join(
+          project.root,
+          swiftHostDirectory,
+        ),
+      );
+    } on Object catch (error) {
+      return DoctorCheck.warning(
+        name,
+        'Not checked: could not read the Swift packages of the Xcode '
+        'project ($error).',
+      );
+    }
+    final int fromSdk;
+    final bool packagesKnown;
+    try {
+      final sdkIndex = swiftModuleIndexFor(
+        files: runtime.host.fileSystem,
+        sdkPath: sdkPath,
+        darwinSdkBundle: bundle,
+        platformSdkName: platform.sdkName,
+        baseName: project.baseName,
+      );
+      fromSdk = project.requiredSwiftModules.where(sdkIndex.contains).length;
+      // Without building, a package provides its product names and the
+      // targets of a local package, plus every target of the graph an
+      // earlier `compose build` resolved; `compose build` checks the built
+      // ones. A remote package not fetched yet may bring other modules.
+      final known = declaredPackageModules(
+        declared,
+        runtime.host.fileSystem,
+        scratchDir: declared.isEmpty ? null : _swiftPmScratch(project),
+      );
+      packagesKnown = known.complete;
+      final index = swiftModuleIndexFor(
+        files: runtime.host.fileSystem,
+        sdkPath: sdkPath,
+        darwinSdkBundle: bundle,
+        platformSdkName: platform.sdkName,
+        baseName: project.baseName,
+        extraModules: known.modules,
+      );
+      missing = unresolvedSwiftImports(project, index);
+    } on Object catch (error) {
+      return DoctorCheck.warning(
+        name,
+        'Not checked: could not read the SDK ($error).',
+      );
+    }
+    if (missing.isEmpty) {
+      final count = project.requiredSwiftModules.length;
+      final fromPackages = count - fromSdk;
+      String modules(int n) => n == 1 ? '1 module' : '$n modules';
+      return DoctorCheck.success(
+        name,
+        count == 0
+            ? 'No unconditional imports to check'
+            : fromPackages > 0
+            ? '${modules(count)} resolve: $fromSdk from the Darwin SDK, '
+                  '$fromPackages from Swift packages'
+            : count == 1
+            ? '1 module resolves against the Darwin SDK'
+            : '$count modules resolve against the Darwin SDK',
+      );
+    }
+    if (!packagesKnown) {
+      return DoctorCheck.warning(
+        name,
+        'Checked when `xcross compose build` builds the Swift packages '
+        '(not known before they are fetched):\n'
+        '${formatUnresolvedSwiftImports(project, missing).join('\n')}',
+      );
+    }
+    return DoctorCheck.failure(
+      name,
+      '${declared.isEmpty ? 'Not provided by the Darwin SDK' : 'Not provided by the Darwin SDK or the Swift packages'}:\n'
+      '${formatUnresolvedSwiftImports(project, missing).join('\n')}',
+    );
+  }
+
+  /// The SwiftPM scratch directory `compose build` uses for [project], or
+  /// null when it cannot be located (then remote packages count as unknown).
+  String? _swiftPmScratch(KmpProject project) {
+    try {
+      return features.swiftPmBuilder
+          .workspaceFor(
+            project.root,
+            environment: runtime.runner.effectiveEnvironment,
+          )
+          .scratch;
+    } on Object {
+      return null;
+    }
+  }
+
+  /// One row per tool the Compose build resolves. The Darwin SDK and linker
+  /// rows reuse the shared iOS checks once resolved, so a stale SDK or a
+  /// defective `ld64.lld` reads the same as it does for Flutter.
+  Future<List<DoctorCheck>> composeToolchain() async {
+    final requirements = await features.composeResolver.requirements(
+      environment: runtime.runner.effectiveEnvironment,
+      projectRoot: projectRoot,
+    );
+    return [
+      environment.hostSupport(),
+      for (final requirement in requirements)
+        await _composeRequirement(requirement),
+    ];
+  }
+
+  Future<DoctorCheck> _composeRequirement(ComposeRequirement requirement) {
+    final name = requirement.name;
+    if (requirement.problem case final problem?) {
+      // `compose build` downloads Kotlin/Native on demand, so its absence
+      // only costs time on the first build.
+      return Future.value(
+        name == ComposeRequirement.kotlinNative
+            ? DoctorCheck.warning(
+                name,
+                'Not installed. The first build downloads it, or run '
+                '`xcross compose setup`.',
+              )
+            : DoctorCheck.failure(name, problem),
+      );
+    }
+    return switch (name) {
+      ComposeRequirement.darwinSdk => environment.darwinSdk(),
+      ComposeRequirement.ld64Lld => environment.iosLinker(),
+      _ => Future.value(
+        DoctorCheck.success(name, 'Found', path: requirement.path),
+      ),
+    };
+  }
+}

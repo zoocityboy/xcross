@@ -1,8 +1,46 @@
 import 'package:test/test.dart';
-import 'package:xcross/src/device/core_device_launcher.dart';
-import 'package:xcross/src/device/device_log.dart';
+import 'package:xcross/src/shared/errors/errors.dart';
+import 'package:xcross/src/shared/flutter/models/flutter/flutter_build_mode.dart';
+import 'package:xcross/src/target/iphone/device/core_device_launcher.dart';
+import 'package:xcross/src/target/iphone/device/device_log.dart';
+
+import 'test_log_output.dart';
 
 void main() {
+  test('VM connection failures preserve Error and Exception identity', () {
+    final error = StateError('socket failed');
+    final exception = Exception('connection refused');
+    for (final failure in [error, exception]) {
+      expect(
+        () => CoreDeviceLauncher.throwVmServiceConnectionFailure(failure),
+        throwsA(same(failure)),
+      );
+    }
+  });
+
+  test('arbitrary VM failure retains useful connection context', () {
+    expect(
+      () => CoreDeviceLauncher.throwVmServiceConnectionFailure('bad channel'),
+      throwsA(
+        isA<XcrossError>().having(
+          (error) => error.toString(),
+          'message',
+          contains('VM Service connection failed: bad channel'),
+        ),
+      ),
+    );
+    expect(
+      () => CoreDeviceLauncher.throwVmServiceConnectionFailure(null),
+      throwsA(
+        isA<XcrossError>().having(
+          (error) => error.toString(),
+          'message',
+          contains('VM Service did not become available'),
+        ),
+      ),
+    );
+  });
+
   test('background launch failure tells the user to unlock the device', () {
     expect(
       CoreDeviceLauncher.launchFailureMessage(
@@ -18,6 +56,21 @@ void main() {
     expect(
       CoreDeviceLauncher.launchFailureMessage('connection lost'),
       'Launch failed: connection lost',
+    );
+  });
+
+  test('r/R explain the missing reload by build mode', () {
+    expect(
+      CoreDeviceLauncher.reloadUnavailableReason(FlutterBuildMode.profile),
+      startsWith('hot reload is not supported in profile mode'),
+    );
+    expect(
+      CoreDeviceLauncher.reloadUnavailableReason(FlutterBuildMode.release),
+      startsWith('hot reload is not supported in release mode'),
+    );
+    expect(
+      CoreDeviceLauncher.reloadUnavailableReason(null),
+      startsWith('this session has no in-place reload'),
     );
   });
 
@@ -60,6 +113,7 @@ void main() {
 
   String pick(List<String> installed, String requested) =>
       CoreDeviceLauncher.pickInstalledBundleId(
+        log: testLog(),
         installed: installed,
         requested: requested,
       );

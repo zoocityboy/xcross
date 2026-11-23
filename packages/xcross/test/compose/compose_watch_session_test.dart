@@ -1,12 +1,21 @@
+@TestOn('!windows')
+library;
+
 import 'dart:io';
 
 import 'package:path/path.dart' as p;
 import 'package:test/test.dart';
-import 'package:xcross/src/compose/watch/compose_watch_session.dart';
-import 'package:xcross/src/compose/watch/kotlin_source_watcher.dart';
-import 'package:xcross/src/models/pack_result.dart';
+import 'package:xcross/src/shared/compose/watch/compose_watch_session.dart';
+import 'package:xcross/src/shared/models/pack_result.dart';
+
+import 'support/compose_platforms.dart';
 
 void main() {
+  late ComposeTestSession session;
+  setUp(() {
+    session = createComposeTestSession();
+  });
+  tearDown(() => session.dispose());
   late Directory root;
 
   setUp(() => root = Directory.systemTemp.createTempSync('xcross_watch'));
@@ -28,7 +37,8 @@ void main() {
     var sessions = 0;
 
     await ComposeWatchSession(
-      watcher: KotlinSourceWatcher(root.path),
+      log: session.fixtureLog,
+      watcher: session.fixtureSourceWatcher(root.path),
       rebuild: () async {
         builds++;
         return packAt('/build/App.app');
@@ -50,7 +60,8 @@ void main() {
     var builds = 0;
 
     await ComposeWatchSession(
-      watcher: KotlinSourceWatcher(root.path),
+      log: session.fixtureLog,
+      watcher: session.fixtureSourceWatcher(root.path),
       rebuild: () async {
         builds++;
         return packAt('/build/App-$builds.app');
@@ -78,7 +89,8 @@ void main() {
     var sessions = 0;
 
     await ComposeWatchSession(
-      watcher: KotlinSourceWatcher(root.path),
+      log: session.fixtureLog,
+      watcher: session.fixtureSourceWatcher(root.path),
       rebuild: () async {
         builds++;
         return packAt('/build/App.app');
@@ -105,7 +117,8 @@ void main() {
       final accepted = <bool>[];
 
       await ComposeWatchSession(
-        watcher: KotlinSourceWatcher(root.path),
+        log: session.fixtureLog,
+        watcher: session.fixtureSourceWatcher(root.path),
         rebuild: () async {
           attempts++;
           if (attempts == 1) throw const FormatException('compile error');

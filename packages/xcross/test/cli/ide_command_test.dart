@@ -1,28 +1,33 @@
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:cli_kit/host/linux/linux_host.dart';
 import 'package:path/path.dart' as p;
 import 'package:test/test.dart';
-import 'package:xcross/src/cli/ide/subcommands/idea_command.dart';
-import 'package:xcross/src/cli/ide/subcommands/vscode_command.dart';
-import 'package:xcross/src/cli/ide/subcommands/vscode_json_merge.dart';
-import 'package:xcross/src/cli/ide/xcross_executable.dart';
-import 'package:xcross/src/errors.dart';
+import 'package:xcross/src/shared/cli/ide/subcommands/idea_command.dart';
+import 'package:xcross/src/shared/cli/ide/subcommands/vscode_command.dart';
+import 'package:xcross/src/shared/cli/ide/subcommands/vscode_json_merge.dart';
+import 'package:xcross/src/shared/cli/ide/xcross_executable.dart';
+import 'package:xcross/src/shared/errors/errors.dart';
+
+import '../log_fixture.dart';
+import 'runtime_fixture.dart';
 
 void main() {
   test('uses configured IDE launcher and selector overrides', () {
-    addTearDown(resetXcrossLauncherOverride);
-    configureXcrossLauncherOverride(
-      '/configured/xcross',
+    final launcher = XcrossIdeLauncher(
+      host: testRuntime().host,
+      log: testLog(),
+      executable: '/configured/xcross',
       configPath: '/configured/config.yaml',
       declarative: true,
     );
 
     expect(
-      resolveXcrossExecutable(subcommand: 'vscode', brokenFeature: 'debugging'),
+      launcher.resolve(subcommand: 'vscode', brokenFeature: 'debugging'),
       '/configured/xcross',
     );
-    expect(generatedIdeEnvironment, {
+    expect(launcher.generatedEnvironment, {
       'XCROSS_CONFIG': '/configured/config.yaml',
     });
   });
@@ -208,79 +213,116 @@ void main() {
 
   group('VscodeCommand upsert', () {
     late Directory temp;
-    late Directory previous;
 
     setUp(() {
       temp = Directory.systemTemp.createTempSync('xcross-ide-vscode-');
-      previous = Directory.current;
-      Directory.current = temp;
     });
 
     tearDown(() {
-      Directory.current = previous;
       temp.deleteSync(recursive: true);
-    });    test(
+    });
+
+    test(
+      testOn: '!windows',
+
       'creates launch.json and settings.json, then skips when current',
       () async {
-        await VscodeCommand().run();
+        await VscodeCommand(
+          XcrossIdeLauncher(
+            host: LinuxHost(currentDirectory: temp.path),
+            log: testLog(),
+            executable: '/test/xcross',
+          ),
+        ).run();
         final launch = File(p.join(temp.path, '.vscode', 'launch.json'));
         final settings = File(p.join(temp.path, '.vscode', 'settings.json'));
         final shim = File(p.join(temp.path, '.vscode', 'xcross_dap.dart'));
         expect(shim.existsSync(), isTrue);
+        final shimSource = shim.readAsStringSync();
+        expect(shimSource, contains("'flutter', 'dap'"));
+        expect(shimSource, contains("if (args.contains('--test')) '--test'"));
+        expect(shimSource, isNot(contains('Platform.environment')));
+        expect(shimSource, isNot(contains('bin/flutter')));
+
         expect(launch.existsSync(), isTrue);
         expect(settings.existsSync(), isTrue);
 
         final launchBefore = launch.readAsStringSync();
         final settingsBefore = settings.readAsStringSync();
-        await VscodeCommand().run();
+        await VscodeCommand(
+          XcrossIdeLauncher(
+            host: LinuxHost(currentDirectory: temp.path),
+            log: testLog(),
+            executable: '/test/xcross',
+          ),
+        ).run();
         expect(launch.readAsStringSync(), launchBefore);
         expect(settings.readAsStringSync(), settingsBefore);
       },
     );
 
-    test('merges into existing files and fixes stale DAP path', () async {
-      final vscode = Directory(p.join(temp.path, '.vscode'))..createSync();
-      File(p.join(vscode.path, 'launch.json')).writeAsStringSync(
-        jsonEncode({
-          'version': '0.2.0',
-          'configurations': [
-            {'name': 'Flutter', 'type': 'dart', 'request': 'launch'},
-          ],
-        }),
-      );
-      File(p.join(vscode.path, 'settings.json')).writeAsStringSync(
-        jsonEncode({'editor.fontSize': 14, dapPathSetting: 'stale'}),
-      );
+    test(
+      testOn: '!windows',
+      'merges into existing files and fixes stale DAP path',
+      () async {
+        final vscode = Directory(p.join(temp.path, '.vscode'))..createSync();
+        File(p.join(vscode.path, 'launch.json')).writeAsStringSync(
+          jsonEncode({
+            'version': '0.2.0',
+            'configurations': [
+              {'name': 'Flutter', 'type': 'dart', 'request': 'launch'},
+            ],
+          }),
+        );
+        File(p.join(vscode.path, 'settings.json')).writeAsStringSync(
+          jsonEncode({'editor.fontSize': 14, dapPathSetting: 'stale'}),
+        );
 
-      await VscodeCommand().run();
+        await VscodeCommand(
+          XcrossIdeLauncher(
+            host: LinuxHost(currentDirectory: temp.path),
+            log: testLog(),
+            executable: '/test/xcross',
+          ),
+        ).run();
 
-      final launch =
-          jsonDecode(
-                File(p.join(vscode.path, 'launch.json')).readAsStringSync(),
-              )
-              as Map;
-      final configs = launch['configurations'] as List;
-      final first = configs.first as Map;
-      final last = configs.last as Map;
-      expect(configs, hasLength(2));
-      expect(first['name'], 'Flutter');
-      expect(last['env'], {'XCROSS': 'true'});
+        final launch =
+            jsonDecode(
+                  File(p.join(vscode.path, 'launch.json')).readAsStringSync(),
+                )
+                as Map;
+        final configs = launch['configurations'] as List;
+        final first = configs.first as Map;
+        final last = configs.last as Map;
+        expect(configs, hasLength(2));
+        expect(first['name'], 'Flutter');
+        expect(last['env'], {'XCROSS': 'true'});
 
-      final settings =
-          jsonDecode(
-                File(p.join(vscode.path, 'settings.json')).readAsStringSync(),
-              )
-              as Map;
-      expect(settings['editor.fontSize'], 14);
-      expect(settings[dapPathSetting], dapPathValue);
-      expect(settings[promptErrorsSetting], false);
-    });
+        final settings =
+            jsonDecode(
+                  File(p.join(vscode.path, 'settings.json')).readAsStringSync(),
+                )
+                as Map;
+        expect(settings['editor.fontSize'], 14);
+        expect(settings[dapPathSetting], dapPathValue);
+        expect(settings[promptErrorsSetting], false);
+      },
+    );
 
-    test('refuses to clobber invalid JSONC', () async {
+    test(testOn: '!windows', 'refuses to clobber invalid JSONC', () async {
       final vscode = Directory(p.join(temp.path, '.vscode'))..createSync();
       File(p.join(vscode.path, 'launch.json')).writeAsStringSync('{not json');
 
-      await expectLater(VscodeCommand().run(), throwsA(isA<XcrossError>()));
+      await expectLater(
+        VscodeCommand(
+          XcrossIdeLauncher(
+            host: LinuxHost(currentDirectory: temp.path),
+            log: testLog(),
+            executable: '/test/xcross',
+          ),
+        ).run(),
+        throwsA(isA<XcrossError>()),
+      );
     });
 
     test('writes the Dart shim and omits debuggerType in DN projects',
@@ -289,7 +331,13 @@ void main() {
         'name: demo\ndependencies:\n  dartnative: ^1.0.0\n',
       );
 
-      await VscodeCommand().run();
+      await VscodeCommand(
+        XcrossIdeLauncher(
+          host: LinuxHost(currentDirectory: temp.path),
+          log: testLog(),
+          executable: '/test/xcross',
+        ),
+      ).run();
 
       final dartShim = File(p.join(temp.path, '.vscode', 'xcross_dart_dap.dart'));
       expect(dartShim.existsSync(), isTrue);
@@ -317,7 +365,13 @@ void main() {
     });
 
     test('skips the Dart shim in plain Dart projects', () async {
-      await VscodeCommand().run();
+      await VscodeCommand(
+        XcrossIdeLauncher(
+          host: LinuxHost(currentDirectory: temp.path),
+          log: testLog(),
+          executable: '/test/xcross',
+        ),
+      ).run();
 
       expect(
         File(
@@ -376,30 +430,44 @@ void main() {
 
   group('IdeaCommand', () {
     late Directory temp;
-    late Directory previous;
 
     setUp(() {
       temp = Directory.systemTemp.createTempSync('xcross-ide-idea-');
-      previous = Directory.current;
-      Directory.current = temp;
     });
 
     tearDown(() {
-      Directory.current = previous;
       temp.deleteSync(recursive: true);
     });
 
-    test('writes .run/xcross_ios_device.run.xml once', () async {
-      await IdeaCommand().run();
-      final file = File(p.join(temp.path, '.run', 'xcross_ios_device.run.xml'));
-      expect(file.existsSync(), isTrue);
-      final body = file.readAsStringSync();
-      expect(body, contains('DAPConfiguration'));
-      expect(body, contains('*.dart'));
+    test(
+      testOn: '!windows',
+      'writes .run/xcross_ios_device.run.xml once',
+      () async {
+        await IdeaCommand(
+          XcrossIdeLauncher(
+            host: LinuxHost(currentDirectory: temp.path),
+            log: testLog(),
+            executable: '/test/xcross',
+          ),
+        ).run();
+        final file = File(
+          p.join(temp.path, '.run', 'xcross_ios_device.run.xml'),
+        );
+        expect(file.existsSync(), isTrue);
+        final body = file.readAsStringSync();
+        expect(body, contains('DAPConfiguration'));
+        expect(body, contains('*.dart'));
 
-      final before = body;
-      await IdeaCommand().run();
-      expect(file.readAsStringSync(), before);
-    });
+        final before = body;
+        await IdeaCommand(
+          XcrossIdeLauncher(
+            host: LinuxHost(currentDirectory: temp.path),
+            log: testLog(),
+            executable: '/test/xcross',
+          ),
+        ).run();
+        expect(file.readAsStringSync(), before);
+      },
+    );
   });
 }

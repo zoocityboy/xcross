@@ -1,7 +1,7 @@
 name: xcross_workspace
 description: >-
   Workspace root for xcross — the CLI lives in packages/xcross.
-version: 1.5.1
+version: 2.1.3
 publish_to: none
 
 environment:
@@ -14,3 +14,9 @@ workspace:
   - packages/darwin_sdk_kit
   - packages/dart_mobile_device
   - packages/frontend_server_kit
+  - tool/repo_analyzer
+
+dev_dependencies:
+  analyzer: 14.7.0
+  arxdeus_lints: ^1.0.1
+  meta: ^1.19.0

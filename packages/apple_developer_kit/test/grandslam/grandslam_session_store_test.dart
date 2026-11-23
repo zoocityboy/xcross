@@ -1,13 +1,69 @@
+import 'dart:convert';
 import 'dart:io';
 
-import 'package:apple_developer_kit/src/errors.dart';
-import 'package:apple_developer_kit/src/grandslam/app_token_exchange.dart';
-import 'package:apple_developer_kit/src/grandslam/grandslam_session_store.dart';
-import 'package:apple_developer_kit/src/secure/local_cipher.dart';
+import 'package:apple_developer_kit/shared/errors/errors.dart';
+import 'package:apple_developer_kit/shared/grandslam/app_token_exchange.dart';
+import 'package:apple_developer_kit/shared/grandslam/grandslam_session_store.dart';
+import 'package:apple_developer_kit/shared/secure/local_cipher.dart';
 import 'package:path/path.dart' as p;
 import 'package:test/test.dart';
 
+import '../support/host_services.dart';
+import '../support/mapped_apple_fixture.dart';
+
 void main() {
+  test(
+    'mapped filesystem migrates, seals, reloads and clears without native bypass',
+    () async {
+      final fixture = MappedAppleFixture();
+      addTearDown(fixture.dispose);
+      final path = fixture.path('session.json');
+      final cipher = LocalCipher(
+        hostServices: fixture.services,
+        keyFilePath: fixture.path('local.key'),
+        machineId: 'mapped-machine',
+      );
+      final store = GrandSlamSessionStore(
+        hostServices: fixture.services,
+        path: path,
+        cipher: cipher,
+      );
+      expect(await store.load(), isNull);
+      final session = GrandSlamSession(
+        username: 'mapped@example.test',
+        teamId: 'TEAM',
+        token: DeveloperServicesLoginToken(
+          adsid: '123',
+          token: 'secret',
+          expiry: DateTime.utc(2030),
+        ),
+      );
+      fixture.fileSystem
+          .file(path)
+          .writeAsStringSync(jsonEncode(session.toJson()));
+      expect((await store.load())!.token.token, 'secret');
+      final sealed = fixture.fileSystem.file(path).readAsStringSync();
+      expect(LocalCipher.isSealed(sealed), isTrue);
+      expect(sealed, isNot(contains('secret')));
+      expect(File(path).existsSync(), isFalse);
+      expect((await store.load())!.username, session.username);
+      final reopened = GrandSlamSessionStore(
+        hostServices: fixture.services,
+        path: path,
+        cipher: LocalCipher(
+          hostServices: fixture.services,
+          keyFilePath: fixture.path('local.key'),
+          machineId: 'mapped-machine',
+        ),
+      );
+      expect((await reopened.load())!.token.token, 'secret');
+      await reopened.clear();
+      expect(await store.load(), isNull);
+      expect(fixture.fileSystem.file(path).existsSync(), isFalse);
+      expect(fixture.permissions.hardened, hasLength(3));
+    },
+  );
+
   late Directory tempDir;
   late String sessionPath;
 
@@ -16,10 +72,14 @@ void main() {
   LocalCipher cipher() => LocalCipher(
     keyFilePath: p.join(tempDir.path, 'local.key'),
     machineId: 'test-machine',
+    hostServices: testHostServices,
   );
 
-  GrandSlamSessionStore store() =>
-      GrandSlamSessionStore(path: sessionPath, cipher: cipher());
+  GrandSlamSessionStore store() => GrandSlamSessionStore(
+    path: sessionPath,
+    cipher: cipher(),
+    hostServices: testHostServices,
+  );
 
   setUp(() {
     tempDir = Directory.systemTemp.createTempSync('xcross_grandslam_session');
@@ -34,7 +94,6 @@ void main() {
     final session = GrandSlamSession(
       username: 'User@Example.com',
       teamId: 'TEAM123',
-      adiLibraryDirectory: tempDir.absolute.path,
       token: DeveloperServicesLoginToken(
         adsid: '123456789',
         token: 'developer-token',
@@ -48,7 +107,6 @@ void main() {
     expect(loaded, isNotNull);
     expect(loaded!.username, session.username);
     expect(loaded.teamId, session.teamId);
-    expect(loaded.adiLibraryDirectory, session.adiLibraryDirectory);
     expect(loaded.token.adsid, session.token.adsid);
     expect(loaded.token.token, session.token.token);
     expect(loaded.token.expiry, session.token.expiry);
@@ -61,11 +119,31 @@ void main() {
     }
   });
 
-  test('round-trips a session without adiLibraryDirectory', () async {
+  test('loads a legacy session that still names an ADI directory', () async {
+    await File(sessionPath).writeAsString(
+      jsonEncode({
+        'username': 'legacy@example.com',
+        'adsid': '1',
+        'token': 'token',
+        'expiryMs': DateTime.now()
+            .toUtc()
+            .add(const Duration(days: 1))
+            .millisecondsSinceEpoch,
+        'teamId': 'TEAM123',
+        'adiLibraryDirectory': tempDir.absolute.path,
+      }),
+    );
+
+    final loaded = await store().load();
+    expect(loaded?.adiLibraryDirectory, tempDir.absolute.path);
+  });
+
+  test('saving keeps the recorded ADI directory for local sessions', () async {
     await store().save(
       GrandSlamSession(
         username: 'windows@example.com',
         teamId: 'TEAM123',
+        adiLibraryDirectory: tempDir.absolute.path,
         token: DeveloperServicesLoginToken(
           adsid: '1',
           token: 'token',
@@ -75,8 +153,47 @@ void main() {
     );
 
     final loaded = await store().load();
-    expect(loaded?.adiLibraryDirectory, isNull);
+    expect(loaded?.adiLibraryDirectory, tempDir.absolute.path);
     expect(loaded?.teamId, 'TEAM123');
+  });
+
+  test('round-trips the anisette backend for both providers', () async {
+    await store().save(
+      GrandSlamSession(
+        username: 'local@example.com',
+        teamId: 'TEAM123',
+        anisetteProvider: 'android-adi',
+        adiLibraryDirectory: tempDir.absolute.path,
+        token: DeveloperServicesLoginToken(
+          adsid: '1',
+          token: 'token',
+          expiry: DateTime.now().toUtc().add(const Duration(days: 1)),
+        ),
+      ),
+    );
+
+    final local = await store().load();
+    expect(local?.anisetteProvider, 'android-adi');
+    expect(local?.anisetteUrl, isNull);
+
+    await store().save(
+      GrandSlamSession(
+        username: 'remote@example.com',
+        teamId: 'TEAM123',
+        anisetteProvider: 'mac-omnisette',
+        anisetteUrl: 'https://omnisette.example.test',
+        token: DeveloperServicesLoginToken(
+          adsid: '1',
+          token: 'token',
+          expiry: DateTime.now().toUtc().add(const Duration(days: 1)),
+        ),
+      ),
+    );
+
+    final remote = await store().load();
+    expect(remote?.anisetteProvider, 'mac-omnisette');
+    expect(remote?.anisetteUrl, 'https://omnisette.example.test');
+    expect(remote?.adiLibraryDirectory, isNull);
   });
 
   test('invalid JSON errors do not echo persisted token material', () async {
@@ -154,7 +271,9 @@ void main() {
       cipher: LocalCipher(
         keyFilePath: p.join(tempDir.path, 'local.key'),
         machineId: 'a-different-machine',
+        hostServices: testHostServices,
       ),
+      hostServices: testHostServices,
     );
     await expectLater(elsewhere.load(), throwsA(isA<LocalCipherError>()));
   });
