@@ -52,11 +52,13 @@ abstract final class DnAppResolver {
     );
   }
 
-  /// Newest `build/ios/iphoneos/*.app`, or null when there is none.
+  /// Newest built `.app` (`build/xcross-ios`, `build/ios/iphoneos`, or
+  /// `build/ios`), or null when there is none.
   static String? findBuiltApp(String projectRoot) => _findBuiltApp(projectRoot);
 
   static String? _findBuiltApp(String projectRoot) {
     for (final candidate in [
+      p.join(projectRoot, 'build', 'xcross-ios'),
       p.join(projectRoot, 'build', 'ios', 'iphoneos'),
       p.join(projectRoot, 'build', 'ios'),
     ]) {

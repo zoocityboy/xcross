@@ -37,7 +37,9 @@ abstract final class DnHotReloadSetup {
   }) async {
     final projectRoot = context.projectRoot;
     final log = context.log;
-    final dn = DnProject.resolveDnExecutable();
+    final dn = DnProject.resolveDnExecutable(
+      environment: context.runner.effectiveEnvironment,
+    );
     if (dn == null) {
       log.logWarn('dn executable not found; hot reload disabled.');
       return null;

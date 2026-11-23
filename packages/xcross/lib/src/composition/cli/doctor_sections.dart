@@ -239,7 +239,9 @@ final class DoctorSections<T extends PlatformHostInterface> {
               'lib/main.dart does not exist.',
             ),
     );
-    final dn = DnProject.resolveDnExecutable();
+    final dn = DnProject.resolveDnExecutable(
+      environment: runtime.runner.effectiveEnvironment,
+    );
     checks.add(
       dn == null
           ? const DoctorCheck.failure(

@@ -58,7 +58,9 @@ abstract final class DnPackOperation {
         'dartnative_android). cd into your app directory first.',
       );
     }
-    final dn = DnProject.resolveDnExecutable();
+    final dn = DnProject.resolveDnExecutable(
+      environment: context.runner.effectiveEnvironment,
+    );
     if (dn == null) {
       throw XcrossError(
         'dn executable not found. Install it with '
@@ -120,10 +122,12 @@ abstract final class DnPackOperation {
       outputPath: appPath,
       bundleId: bundleId,
       projectRoot: projectRoot,
+      // Complete defines (derived FLUTTER_APP_FLAVOR + dn's injected set):
+      // hot reload compiles must mirror the bundled kernel exactly.
       dartDefines: bundle.injectedDefines.isEmpty
-          ? options.dartDefines
+          ? _effectiveDefines(options)
           : DartDefines.mergeFallback(
-              base: options.dartDefines,
+              base: _effectiveDefines(options),
               fallback: bundle.injectedDefines,
             ),
     );

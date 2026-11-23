@@ -41,15 +41,20 @@ abstract final class DnProject {
   ///
   /// Precedence: explicit `--dn-executable`, `DN_EXECUTABLE` env,
   /// `dn` on `PATH`, `~/zero/bin/dn` from the documented install.
-  /// Returns null when nothing is found.
-  static String? resolveDnExecutable({String? explicit}) {
+  /// Returns null when nothing is found. [environment] is the composition
+  /// root's effective environment (xcross config overlays included); it
+  /// defaults to the process environment.
+  static String? resolveDnExecutable({
+    String? explicit,
+    Map<String, String>? environment,
+  }) {
     if (explicit != null && explicit.isNotEmpty) return explicit;
-    final env = Platform.environment['DN_EXECUTABLE'];
-    if (env != null && env.isNotEmpty) return env;
-    final onPath = _which('dn');
+    final env = environment ?? Platform.environment;
+    final configured = env['DN_EXECUTABLE'];
+    if (configured != null && configured.isNotEmpty) return configured;
+    final onPath = _which('dn', env);
     if (onPath != null) return onPath;
-    final home =
-        Platform.environment['HOME'] ?? Platform.environment['USERPROFILE'];
+    final home = env['HOME'] ?? env['USERPROFILE'];
     if (home != null && home.isNotEmpty) {
       final candidate = p.join(
         home,
@@ -64,8 +69,8 @@ abstract final class DnProject {
     return null;
   }
 
-  static String? _which(String name) {
-    final path = Platform.environment['PATH'] ?? '';
+  static String? _which(String name, Map<String, String> environment) {
+    final path = environment['PATH'] ?? '';
     final entries = path.split(Platform.isWindows ? ';' : ':');
     final candidates = Platform.isWindows
         ? ['$name.exe', '$name.bat', name]
