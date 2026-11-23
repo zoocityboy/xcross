@@ -1,6 +1,9 @@
 import 'package:cli_kit/shared/platform/platform_host.dart';
+import 'package:frontend_server_kit/shared/compiler/package_uris.dart';
 import 'package:meta/meta.dart';
+import 'package:xcross/src/shared/flutter/build/dart_plugin_registrant.dart';
 import 'package:xcross/src/shared/flutter/flutter_build_runtime.dart';
+import 'package:xcross/src/shared/flutter/flutter_kernel_compiler.dart';
 import 'package:xcross/src/shared/flutter/models/flutter/flutter_build_mode.dart';
 import 'package:xcross/src/shared/flutter/models/hot_reload_config.dart';
 
@@ -59,6 +62,19 @@ abstract final class HotReloadSetup {
       runtime.runner.hostExecutableName(isAot ? 'dartaotruntime' : 'dart'),
     );
 
+    // The bundle compile writes (or removes) this during pack; referencing
+    // the same URI keeps a restarted isolate's plugin registrant identical
+    // to the one the installed kernel used.
+    final registrantPath = DartPluginRegistrant.pathFor(projectRoot);
+    final registrantUri = await _registrantUri(
+      runtime: runtime,
+      projectRoot: projectRoot,
+      packageConfig: packageConfig,
+      entrypoint: entrypoint,
+      flutterRoot: flutterRoot,
+      registrantPath: registrantPath,
+    );
+
     // Persistent dill output for incremental reloads.
     final intermediates = runtime.policy.buildDirectory(
       projectRoot,
@@ -78,8 +94,55 @@ abstract final class HotReloadSetup {
       projectRoot: projectRoot,
       outputDill: outputDill,
       dartDefines: dartDefines,
+      extraSources: [
+        if (registrantUri != null) ...[
+          registrantUri,
+          'package:flutter/src/dart_plugin_registrant.dart',
+        ],
+      ],
       warmDill: paths.join(intermediates, '.kernel', 'app.dill'),
       verbose: verbose,
+    );
+  }
+
+  /// URI of the Dart plugin registrant the bundle compile generated, using
+  /// the same `package:`/`file:` form so the VM can bind it.
+  static Future<String?> _registrantUri<T extends PlatformHostInterface>({
+    required FlutterBuildRuntime<T> runtime,
+    required String projectRoot,
+    required String packageConfig,
+    required String entrypoint,
+    required String flutterRoot,
+    required String registrantPath,
+  }) async {
+    final paths = runtime.host.paths.context;
+    if (!runtime.host.fileSystem.file(registrantPath).existsSync()) {
+      return null;
+    }
+    // Regenerate first: a plugin added since the last pack must register in
+    // reloaded isolates too, and generate() owns the on-disk file.
+    final registrant = DartPluginRegistrant(
+      runtime.host.fileSystem,
+      paths,
+      onWarning: runtime.runner.log.logWarn,
+    );
+    final generated = await registrant.generate(
+      projectRoot: projectRoot,
+      packageConfigPath: packageConfig,
+      entrypoint: paths.isAbsolute(entrypoint)
+          ? entrypoint
+          : paths.join(projectRoot, entrypoint),
+      flutterRoot: flutterRoot,
+    );
+    if (generated == null) return null;
+    final packageUris = await PackageUriLoader(
+      fileSystem: runtime.host.fileSystem,
+      paths: paths,
+    ).load(packageConfig);
+    return FlutterKernelCompiler.dartPluginRegistrantUri(
+      generated,
+      packageUris,
+      paths: paths,
     );
   }
 }

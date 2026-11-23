@@ -96,6 +96,7 @@ final class FrontendServerSession {
       '-Ddart.developer.serviceExtensionStream.enabled=true',
       for (final define in options.dartDefines) '-D$define',
       ...options.modeOptions,
+      for (final source in options.extraSources) ...['--source', source],
       if (options.trackWidgetCreation) '--track-widget-creation',
       if (options.initializeFromDill case final dill?) ...[
         '--initialize-from-dill',

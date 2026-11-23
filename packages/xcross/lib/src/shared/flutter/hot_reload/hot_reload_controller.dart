@@ -103,6 +103,7 @@ final class HotReloadController {
       modeOptions: FlutterBuildMode.debug.frontendServerOptions(
         config.dartDefines,
       ),
+      extraSources: config.extraSources,
       initializeFromDill: initializeFromDill,
       onTrace: log.logTrace,
     );
