@@ -1,9 +1,10 @@
 import 'dart:io';
+
 import 'package:cli_kit/host/linux/linux_host.dart';
 import 'package:path/path.dart' as p;
-
 import 'package:test/test.dart';
 import 'package:xcross/src/shared/errors/build_error.dart';
+import 'package:xcross/src/shared/flutter/models/flutter/dart_defines.dart';
 import 'package:xcross/src/shared/flutter/project/dart_defines_reader.dart';
 
 void main() {
@@ -220,14 +221,12 @@ void main() {
   group('DartDefines.withFlavorDefine', () {
     test('appends the flavor define unless null or explicit', () {
       expect(DartDefines.withFlavorDefine([], null), isEmpty);
-      expect(
-        DartDefines.withFlavorDefine([], 'dev'),
-        ['FLUTTER_APP_FLAVOR=dev'],
-      );
-      expect(
-        DartDefines.withFlavorDefine(['FLUTTER_APP_FLAVOR=prod'], 'dev'),
-        ['FLUTTER_APP_FLAVOR=prod'],
-      );
+      expect(DartDefines.withFlavorDefine([], 'dev'), [
+        'FLUTTER_APP_FLAVOR=dev',
+      ]);
+      expect(DartDefines.withFlavorDefine(['FLUTTER_APP_FLAVOR=prod'], 'dev'), [
+        'FLUTTER_APP_FLAVOR=prod',
+      ]);
     });
   });
 }

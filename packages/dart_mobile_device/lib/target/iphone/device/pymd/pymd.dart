@@ -352,9 +352,7 @@ final class Pymd {
           'dvt launch attempt $attempt/$maxAttempts failed transiently, '
           'retrying: $lastError',
         );
-        await (delay ?? Future.delayed)(
-          Duration(seconds: attempt),
-        );
+        await (delay ?? Future.delayed)(Duration(seconds: attempt));
         continue;
       }
       break;

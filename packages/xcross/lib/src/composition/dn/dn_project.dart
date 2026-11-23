@@ -1,5 +1,6 @@
 import 'dart:io';
 
+import 'package:meta/meta.dart';
 import 'package:path/path.dart' as p;
 import 'package:yaml/yaml.dart';
 
@@ -9,6 +10,7 @@ import 'package:yaml/yaml.dart';
 /// `dartnative` (directly or via the lock file). The `dn` CLI wraps the
 /// `flutter` tool against the Zero engine and lives in `~/zero/bin` after
 /// the documented install.
+@internal
 abstract final class DnProject {
   /// Whether [projectRoot] looks like a DartNative project.
   ///
@@ -46,9 +48,15 @@ abstract final class DnProject {
     if (env != null && env.isNotEmpty) return env;
     final onPath = _which('dn');
     if (onPath != null) return onPath;
-    final home = Platform.environment['HOME'] ?? Platform.environment['USERPROFILE'];
+    final home =
+        Platform.environment['HOME'] ?? Platform.environment['USERPROFILE'];
     if (home != null && home.isNotEmpty) {
-      final candidate = p.join(home, 'zero', 'bin', Platform.isWindows ? 'dn.bat' : 'dn');
+      final candidate = p.join(
+        home,
+        'zero',
+        'bin',
+        Platform.isWindows ? 'dn.bat' : 'dn',
+      );
       if (File(candidate).existsSync()) return candidate;
       final plain = p.join(home, 'zero', 'bin', 'dn');
       if (File(plain).existsSync()) return plain;
@@ -59,7 +67,9 @@ abstract final class DnProject {
   static String? _which(String name) {
     final path = Platform.environment['PATH'] ?? '';
     final entries = path.split(Platform.isWindows ? ';' : ':');
-    final candidates = Platform.isWindows ? ['$name.exe', '$name.bat', name] : [name];
+    final candidates = Platform.isWindows
+        ? ['$name.exe', '$name.bat', name]
+        : [name];
     for (final dir in entries) {
       for (final candidate in candidates) {
         final full = p.join(dir, candidate);

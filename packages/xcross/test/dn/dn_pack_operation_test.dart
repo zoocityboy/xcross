@@ -1,47 +1,36 @@
+import 'package:cli_kit/host/linux/linux_host.dart';
+import 'package:path/path.dart' as p;
 import 'package:test/test.dart';
-import 'package:xcross/src/dn/dn_build_options.dart';
-import 'package:xcross/src/dn/dn_pack_operation.dart';
+import 'package:xcross/src/composition/dn/dn_pack_operation.dart';
+import 'package:xcross/src/shared/flutter/flutter_build_options_resolver.dart';
+import 'package:xcross/src/shared/flutter/models/flutter/flutter_build_options.dart';
+import 'package:xcross/src/shared/flutter/project/dart_defines_reader.dart';
 
 void main() {
-  group('DnBuildOptions', () {
-    test('resolve merges dart-define-from-file under explicit defines', () async {
-      final options = await DnBuildOptions.resolve(
-        target: 'lib/main.dart',
-        dartDefine: ['B=2'],
-        dartDefineFromFile: [],
-        pub: true,
-      );
-      expect(options.dartDefines, ['B=2']);
-      expect(options.target, 'lib/main.dart');
-      expect(options.pub, isTrue);
-    });
+  group('DnPackOperation build options', () {
+    final defines = DartDefinesReader(LinuxHost().fileSystem, p.context);
+    final resolver = FlutterBuildOptionsResolver(defines);
 
-    test('resolve appends FLUTTER_APP_FLAVOR unless explicitly defined',
-        () async {
-      final flavored = await DnBuildOptions.resolve(
-        target: 'lib/main.dart',
-        dartDefine: [],
-        dartDefineFromFile: [],
-        pub: true,
-        flavor: 'dev',
-      );
-      expect(flavored.dartDefines, ['FLUTTER_APP_FLAVOR=dev']);
-
-      final explicit = await DnBuildOptions.resolve(
-        target: 'lib/main.dart',
-        dartDefine: ['FLUTTER_APP_FLAVOR=prod'],
-        dartDefineFromFile: [],
-        pub: true,
-        flavor: 'dev',
-      );
-      expect(explicit.dartDefines, ['FLUTTER_APP_FLAVOR=prod']);
-    });
+    test(
+      'resolve merges dart-define-from-file under explicit defines',
+      () async {
+        final options = await resolver.resolve(
+          target: 'lib/main.dart',
+          dartDefine: ['B=2'],
+          dartDefineFromFile: [],
+          pub: true,
+        );
+        expect(options.dartDefines, ['B=2']);
+        expect(options.target, 'lib/main.dart');
+        expect(options.pub, isTrue);
+      },
+    );
   });
 
   group('DnPackOperation.bundleArgs', () {
     test('builds ios bundle args with defines and build-number', () {
       final args = DnPackOperation.bundleArgs(
-        options: const DnBuildOptions(
+        options: const FlutterBuildOptions(
           // ignore: avoid_redundant_argument_values
           target: 'lib/main.dart',
           dartDefines: ['A=1'],
@@ -49,28 +38,25 @@ void main() {
         ),
         assetDir: '/tmp/assets',
       );
-      expect(
-        args,
-        [
-          'build',
-          'bundle',
-          '-v',
-          '-t',
-          'lib/main.dart',
-          '--target-platform',
-          'ios',
-          '--asset-dir',
-          '/tmp/assets',
-          '--build-number=7',
-          '-D',
-          'A=1',
-        ],
-      );
+      expect(args, [
+        'build',
+        'bundle',
+        '-v',
+        '-t',
+        'lib/main.dart',
+        '--target-platform',
+        'ios',
+        '--asset-dir',
+        '/tmp/assets',
+        '--build-number=7',
+        '-D',
+        'A=1',
+      ]);
     });
 
     test('adds --no-pub and flavor define', () {
       final args = DnPackOperation.bundleArgs(
-        options: const DnBuildOptions(pub: false, flavor: 'dev'),
+        options: const FlutterBuildOptions(pub: false, flavor: 'dev'),
         assetDir: '/tmp/assets',
       );
       expect(args, contains('--no-pub'));
@@ -79,16 +65,15 @@ void main() {
 
     test('explicit flavor define wins over --flavor', () {
       final args = DnPackOperation.bundleArgs(
-        options: const DnBuildOptions(
+        options: const FlutterBuildOptions(
           dartDefines: ['FLUTTER_APP_FLAVOR=prod'],
           flavor: 'dev',
         ),
         assetDir: '/tmp/assets',
       );
-      expect(
-        args.where((a) => a.startsWith('FLUTTER_APP_FLAVOR=')).toList(),
-        ['FLUTTER_APP_FLAVOR=prod'],
-      );
+      expect(args.where((a) => a.startsWith('FLUTTER_APP_FLAVOR=')).toList(), [
+        'FLUTTER_APP_FLAVOR=prod',
+      ]);
     });
   });
 }

@@ -1,14 +1,16 @@
 import 'dart:io';
 
+import 'package:meta/meta.dart';
 import 'package:path/path.dart' as p;
-import 'package:xcross/src/errors.dart';
-import 'package:xcross/src/models/pack_result.dart';
+import 'package:xcross/src/shared/errors/errors.dart';
+import 'package:xcross/src/shared/models/pack_result.dart';
 
 /// Resolves an already-built DartNative iOS `.app` into a [PackResult].
 ///
 /// xcross does not reimplement the DartNative/Zero build: `dn build`
 /// produces the `.app` (on macOS today), and xcross reuses its own
 /// signing, install, and CoreDevice launch pipeline from there.
+@internal
 abstract final class DnAppResolver {
   static final _bundleIdPattern = RegExp(
     r'<key>CFBundleIdentifier</key>\s*<string>([^<]*)</string>',
@@ -18,7 +20,11 @@ abstract final class DnAppResolver {
   ///
   /// Precedence: explicit `--app-path`, then `build/ios/iphoneos/*.app`
   /// (newest first). Throws [XcrossError] when nothing is found.
-  static PackResult resolve({required String projectRoot, String? appPath, String? bundleIdOverride}) {
+  static PackResult resolve({
+    required String projectRoot,
+    String? appPath,
+    String? bundleIdOverride,
+  }) {
     final app = appPath != null && appPath.isNotEmpty
         ? appPath
         : _findBuiltApp(projectRoot);
@@ -35,11 +41,15 @@ abstract final class DnAppResolver {
     final bundleId = bundleIdOverride?.isNotEmpty == true
         ? bundleIdOverride!
         : readBundleId(app) ??
-            (() => throw XcrossError(
-                  'Could not read CFBundleIdentifier from $app/Info.plist. '
-                  'Pass --bundle-id.',
-                ))();
-    return PackResult(outputPath: app, bundleId: bundleId, projectRoot: projectRoot);
+              (() => throw XcrossError(
+                'Could not read CFBundleIdentifier from $app/Info.plist. '
+                'Pass --bundle-id.',
+              ))();
+    return PackResult(
+      outputPath: app,
+      bundleId: bundleId,
+      projectRoot: projectRoot,
+    );
   }
 
   /// Newest `build/ios/iphoneos/*.app`, or null when there is none.
@@ -52,12 +62,15 @@ abstract final class DnAppResolver {
     ]) {
       final dir = Directory(candidate);
       if (!dir.existsSync()) continue;
-      final apps = dir
-          .listSync()
-          .whereType<Directory>()
-          .where((e) => e.path.endsWith('.app'))
-          .toList()
-        ..sort((a, b) => b.statSync().modified.compareTo(a.statSync().modified));
+      final apps =
+          dir
+              .listSync()
+              .whereType<Directory>()
+              .where((e) => e.path.endsWith('.app'))
+              .toList()
+            ..sort(
+              (a, b) => b.statSync().modified.compareTo(a.statSync().modified),
+            );
       if (apps.isNotEmpty) return apps.first.path;
     }
     return null;

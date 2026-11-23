@@ -1,8 +1,10 @@
 import 'dart:io';
 
+import 'package:cli_kit/host/linux/linux_host.dart';
+
 import 'package:path/path.dart' as p;
 import 'package:test/test.dart';
-import 'package:xcross/src/dap/xcross_dap.dart';
+import 'package:xcross/src/shared/dap/xcross_dap.dart';
 
 void main() {
   group('XcrossDap.runArguments', () {
@@ -28,7 +30,11 @@ void main() {
         'name: demo\ndependencies:\n  dartnative: ^1.0.0\n',
       );
       expect(
-        XcrossDap.runArguments(cwd: dir.path, target: 'lib/main.dart'),
+        XcrossDap.runArguments(
+          host: LinuxHost(),
+          cwd: dir.path,
+          target: 'lib/main.dart',
+        ),
         ['dn', 'run', '--target', 'lib/main.dart'],
       );
     });
@@ -38,7 +44,11 @@ void main() {
         'name: demo\ndependencies:\n  flutter:\n    sdk: flutter\n',
       );
       expect(
-        XcrossDap.runArguments(cwd: dir.path, target: 'lib/main.dart'),
+        XcrossDap.runArguments(
+          host: LinuxHost(),
+          cwd: dir.path,
+          target: 'lib/main.dart',
+        ),
         ['flutter', 'run', '--target', 'lib/main.dart'],
       );
     });
@@ -46,6 +56,7 @@ void main() {
     test('selects flutter run without a pubspec and passes args through', () {
       expect(
         XcrossDap.runArguments(
+          host: LinuxHost(),
           cwd: temp.path,
           target: 'lib/main.dart',
           args: ['--udid', 'ABC'],
@@ -60,6 +71,7 @@ void main() {
       );
       expect(
         XcrossDap.runArguments(
+          host: LinuxHost(),
           cwd: dir.path,
           target: 'lib/main.dart',
           args: ['--udid', 'ABC'],

@@ -1,5 +1,7 @@
 import 'package:cli_kit/shared/platform/platform_host.dart';
 import 'package:meta/meta.dart';
+import 'package:xcross/src/composition/dn/dn_app_resolver.dart';
+import 'package:xcross/src/composition/dn/dn_project.dart';
 import 'package:xcross/src/composition/flutter/ios_gen_snapshot.dart';
 import 'package:xcross/src/composition/ios_target.dart';
 import 'package:xcross/src/shared/cli/basic/doctor_environment_checks.dart';
@@ -15,6 +17,7 @@ import 'package:xcross/src/shared/compose/toolchain/compose_toolchain_resolver.d
 import 'package:xcross/src/shared/flutter/gen_snapshot/ios_gen_snapshot_mode.dart';
 import 'package:xcross/src/shared/flutter/gen_snapshot/ios_gen_snapshot_resolver.dart';
 import 'package:xcross/src/shared/flutter/models/flutter/flutter_build_mode.dart';
+import 'package:xcross/src/shared/flutter/project/pubspec_info_reader.dart';
 import 'package:xcross/src/shared/packages/package_config_resolver.dart';
 import 'package:xcross/src/shared/runtime/xcross_runtime.dart';
 import 'package:xcross/src/target/shared/runtime/build_features.dart';
@@ -40,6 +43,12 @@ final class DoctorSections<T extends PlatformHostInterface> {
 
   List<DoctorSection> get flutter => [
     DoctorSection('Flutter project', flutterProject),
+    DoctorSection('iOS toolchain', environment.flutterToolchain),
+    DoctorSection('Deployment', environment.deployment),
+  ];
+
+  List<DoctorSection> get dn => [
+    DoctorSection('DartNative project', dnProject),
     DoctorSection('iOS toolchain', environment.flutterToolchain),
     DoctorSection('Deployment', environment.deployment),
   ];
@@ -187,6 +196,69 @@ final class DoctorSections<T extends PlatformHostInterface> {
             'No package_config.json; `flutter pub get` will be required.',
           )
         : DoctorCheck.success('Packages', 'Resolved', path: packageConfig);
+  }
+
+  /// Read-only checks for a DartNative workspace: the pubspec, the `dn` CLI
+  /// the bundle build shells out to, and the last `xcross dn build` output.
+  Future<List<DoctorCheck>> dnProject() async {
+    if (!_exists('pubspec.yaml')) {
+      return const [
+        DoctorCheck.warning(
+          'Project',
+          'No pubspec.yaml in the current directory.',
+        ),
+      ];
+    }
+    final checks = <DoctorCheck>[];
+    try {
+      final pubspec = PubspecInfoReader(
+        runtime.host.fileSystem,
+        runtime.host.paths.context,
+      ).loadSync(projectRoot);
+      checks.add(DoctorCheck.success('Project', pubspec.name));
+    } on Object catch (error) {
+      checks.add(DoctorCheck.failure('Project', '$error'));
+    }
+    if (!DnProject.isDartNativeProject(projectRoot)) {
+      checks.add(
+        const DoctorCheck.warning(
+          'DartNative dependency',
+          'pubspec.yaml does not depend on dartnative, dartnative_ios, or '
+              'dartnative_android.',
+        ),
+      );
+    }
+    final entrypoint = runtime.host.fileSystem.file(
+      runtime.host.paths.context.join(projectRoot, 'lib', 'main.dart'),
+    );
+    checks.add(
+      entrypoint.existsSync()
+          ? DoctorCheck.success('Entrypoint', 'Found', path: entrypoint.path)
+          : const DoctorCheck.failure(
+              'Entrypoint',
+              'lib/main.dart does not exist.',
+            ),
+    );
+    final dn = DnProject.resolveDnExecutable();
+    checks.add(
+      dn == null
+          ? const DoctorCheck.failure(
+              'dn CLI',
+              'Not found. Install with '
+                  '`curl -fsSL https://cdn.dartnative.com/install.sh | sh`.',
+            )
+          : DoctorCheck.success('dn CLI', 'Found', path: dn),
+    );
+    final app = DnAppResolver.findBuiltApp(projectRoot);
+    checks.add(
+      app == null
+          ? const DoctorCheck.warning(
+              'DartNative app',
+              'No build/xcross-ios/*.app yet; run `xcross dn build`.',
+            )
+          : DoctorCheck.success('DartNative app', 'Found', path: app),
+    );
+    return checks;
   }
 
   Future<List<DoctorCheck>> composeProject() async {

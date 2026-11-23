@@ -1,7 +1,5 @@
-import 'dart:io';
-
-import 'package:dart_mobile_device/src/errors.dart';
-import 'package:dart_mobile_device/src/pymd/pymd.dart';
+import 'package:dart_mobile_device/shared/errors/errors.dart';
+import 'package:dart_mobile_device/target/iphone/device/pymd/pymd.dart';
 import 'package:test/test.dart';
 
 void main() {
@@ -9,7 +7,9 @@ void main() {
     test('transient DVT race is retryable', () {
       expect(
         Pymd.isTransientLaunchError(
-          TunnelError('pymobiledevice3 failed: Failed to launch process: -402653103'),
+          TunnelError(
+            'pymobiledevice3 failed: Failed to launch process: -402653103',
+          ),
         ),
         isTrue,
       );
@@ -18,7 +18,9 @@ void main() {
     test('missing pid line is retryable', () {
       expect(
         Pymd.isTransientLaunchError(
-          TunnelError('expected "Process launched with pid <N>" in stdout, got: '),
+          TunnelError(
+            'expected "Process launched with pid <N>" in stdout, got: ',
+          ),
         ),
         isTrue,
       );
@@ -38,7 +40,9 @@ void main() {
     test('background launch rejection is permanent', () {
       expect(
         Pymd.isTransientLaunchError(
-          TunnelError('Background launch requested but app is not in foreground'),
+          TunnelError(
+            'Background launch requested but app is not in foreground',
+          ),
         ),
         isFalse,
       );

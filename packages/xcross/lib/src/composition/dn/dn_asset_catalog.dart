@@ -1,8 +1,9 @@
 import 'dart:convert';
 import 'dart:io';
 
-import 'package:cli_kit/cli_kit.dart';
+import 'package:cli_kit/shared/logging/logging.dart';
 import 'package:image/image.dart' as img;
+import 'package:meta/meta.dart';
 import 'package:path/path.dart' as p;
 
 /// Pure-Dart replacement for `actool` (Asset Catalog compiler), which is
@@ -25,6 +26,7 @@ import 'package:path/path.dart' as p;
 ///
 /// Returns the `Info.plist` fragment keys to merge, or null when the project
 /// has no asset catalog (icon stays default, splash skipped — same as before).
+@internal
 abstract final class DnAssetCatalog {
   /// Required icon slots as (points, scale): the set `actool` emits for a
   /// universal iOS app icon.
@@ -50,11 +52,12 @@ abstract final class DnAssetCatalog {
   static Future<DnCompiledAssets?> compile({
     required String projectRoot,
     required String bundleDir,
+    required Log log,
   }) async {
     final catalog = _findCatalog(projectRoot);
     if (catalog == null) return null;
 
-    final iconFiles = await _compileAppIcon(catalog, bundleDir);
+    final iconFiles = await _compileAppIcon(catalog, bundleDir, log: log);
     final launchSets = await _stageLaunchImages(catalog, bundleDir);
     if (iconFiles == null && launchSets == null) return null;
     return DnCompiledAssets(
@@ -82,41 +85,41 @@ abstract final class DnAssetCatalog {
   /// `CFBundleIconFiles`, or null when no usable source exists.
   static Future<List<String>?> _compileAppIcon(
     String catalog,
-    String bundleDir,
-  ) =>
-      Log.logStep('Compiling AppIcon', () async {
-        final setDir = p.join(catalog, 'AppIcon.appiconset');
-        final manifest = File(p.join(setDir, 'Contents.json'));
-        if (!manifest.existsSync()) return null;
-        final source = _appIconSource(setDir, manifest.readAsStringSync());
-        if (source == null) return null;
-        final decoded = img.decodeImage(await File(source).readAsBytes());
-        if (decoded == null) {
-          Log.logWarn('could not decode AppIcon source $source; icon skipped.');
-          return null;
-        }
-        final names = <String>[];
-        for (final (points, scale) in _iconSlots) {
-          final px = (points * scale).round();
-          // The 1024 marketing icon is copied at native resolution when the
-          // source is smaller (never upscale beyond source quality); every
-          // device slot is resized exactly.
-          final resized = px == 1024 && decoded.width < 1024
-              ? decoded
-              : img.copyResize(
-                  decoded,
-                  width: px,
-                  height: px,
-                  interpolation: img.Interpolation.cubic,
-                );
-          final base =
-              'AppIcon${points % 1 == 0 ? points.toInt() : points}x$points@${scale}x';
-          final file = File(p.join(bundleDir, '$base.png'));
-          await file.writeAsBytes(img.encodePng(resized));
-          names.add(base);
-        }
-        return names;
-      });
+    String bundleDir, {
+    required Log log,
+  }) => log.logStep('Compiling AppIcon', () async {
+    final setDir = p.join(catalog, 'AppIcon.appiconset');
+    final manifest = File(p.join(setDir, 'Contents.json'));
+    if (!manifest.existsSync()) return null;
+    final source = _appIconSource(setDir, manifest.readAsStringSync());
+    if (source == null) return null;
+    final decoded = img.decodeImage(await File(source).readAsBytes());
+    if (decoded == null) {
+      log.logWarn('could not decode AppIcon source $source; icon skipped.');
+      return null;
+    }
+    final names = <String>[];
+    for (final (points, scale) in _iconSlots) {
+      final px = (points * scale).round();
+      // The 1024 marketing icon is copied at native resolution when the
+      // source is smaller (never upscale beyond source quality); every
+      // device slot is resized exactly.
+      final resized = px == 1024 && decoded.width < 1024
+          ? decoded
+          : img.copyResize(
+              decoded,
+              width: px,
+              height: px,
+              interpolation: img.Interpolation.cubic,
+            );
+      final base =
+          'AppIcon${points % 1 == 0 ? points.toInt() : points}x$points@${scale}x';
+      final file = File(p.join(bundleDir, '$base.png'));
+      await file.writeAsBytes(img.encodePng(resized));
+      names.add(base);
+    }
+    return names;
+  });
 
   /// Pick the 1024px universal source, falling back to the largest available.
   static String? _appIconSource(String setDir, String contentsJson) {
@@ -170,8 +173,8 @@ abstract final class DnAssetCatalog {
         final doc =
             jsonDecode(manifest.readAsStringSync()) as Map<String, dynamic>;
         final scales = <String>[];
-        for (final entry in ((doc['images'] as List?) ?? [])
-            .cast<Map<String, dynamic>>()) {
+        for (final entry
+            in ((doc['images'] as List?) ?? []).cast<Map<String, dynamic>>()) {
           final filename = entry['filename'] as String?;
           if (filename == null || filename.isEmpty) continue;
           final source = File(p.join(setDir, filename));
@@ -221,6 +224,7 @@ abstract final class DnAssetCatalog {
 }
 
 /// Result of [DnAssetCatalog.compile].
+@internal
 final class DnCompiledAssets {
   const DnCompiledAssets({required this.iconFiles, required this.launchSets});
 
@@ -241,6 +245,7 @@ final class DnCompiledAssets {
 /// One staged launch imageset: `<name>.png` / `<name>@2x.png` /
 /// `<name>@3x.png` in the bundle root, per the scales present in the
 /// imageset manifest.
+@internal
 final class DnLaunchImageSet {
   const DnLaunchImageSet({required this.name, required this.scales});
 

@@ -1,6 +1,6 @@
 import 'package:path/path.dart' as p;
 import 'package:test/test.dart';
-import 'package:xcross/src/dn/dn_native_deps.dart';
+import 'package:xcross/src/composition/dn/dn_native_deps.dart';
 
 void main() {
   group('DnNativeDeps', () {

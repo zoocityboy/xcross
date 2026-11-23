@@ -77,6 +77,41 @@ abstract final class DartDefines {
     return result;
   }
 
+  /// Key part of a `KEY=value` (or bare `KEY`) define string.
+  static String keyOf(String define) {
+    final eq = define.indexOf('=');
+    return eq < 0 ? define : define.substring(0, eq);
+  }
+
+  /// Append [fallback] defines for keys [base] doesn't already define.
+  ///
+  /// Tool-injected constants (`FLUTTER_*`, license keys) merge this way: an
+  /// explicitly passed key wins (dn's own precedence), the rest is appended
+  /// in order. frontend_server resolves duplicate keys last-wins, so
+  /// appending unfiltered would invert the precedence.
+  static List<String> mergeFallback({
+    required List<String> base,
+    required List<String> fallback,
+  }) {
+    final baseKeys = {for (final d in base) keyOf(d)};
+    return [
+      ...base,
+      for (final d in fallback)
+        if (!baseKeys.contains(keyOf(d))) d,
+    ];
+  }
+
+  /// Append `-DFLUTTER_APP_FLAVOR=<flavor>` unless [flavor] is null or the
+  /// [defines] already set the key explicitly (explicit wins).
+  ///
+  /// Applied in `*BuildOptions.resolve` so the bundle compile and hot reload
+  /// compiles see identical constants; packers keep their own guard for
+  /// directly-constructed options.
+  static List<String> withFlavorDefine(List<String> defines, String? flavor) {
+    if (flavor == null || _isSet(defines, appFlavor)) return defines;
+    return [...defines, '$appFlavor=$flavor'];
+  }
+
   static const _defineOptions = '--dart-define or --dart-define-from-file';
 
   static bool _isSet(List<String> defines, String key) =>

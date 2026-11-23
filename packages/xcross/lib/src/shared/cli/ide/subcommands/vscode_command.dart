@@ -5,9 +5,9 @@ import 'package:args/command_runner.dart';
 import 'package:cli_kit/shared/logging/logging.dart';
 import 'package:cli_kit/shared/platform/platform_host.dart';
 import 'package:meta/meta.dart';
-import 'package:xcross/src/dn/dn_project.dart';
 import 'package:xcross/src/shared/cli/ide/subcommands/vscode_json_merge.dart';
 import 'package:xcross/src/shared/cli/ide/xcross_executable.dart';
+import 'package:xcross/src/shared/dn/dn_project_detector.dart';
 import 'package:xcross/src/shared/errors/errors.dart';
 
 /// `xcross ide vscode` — write / upsert `.vscode/` so Run & Debug / Restart /
@@ -34,7 +34,10 @@ final class VscodeCommand extends Command<void> {
   Future<void> run() async {
     final paths = launcher.host.paths.context;
     final projectRoot = paths.current;
-    final dartNative = DnProject.isDartNativeProject(projectRoot);
+    final dartNative = DnProjectDetector(
+      launcher.host.fileSystem,
+      launcher.host.paths.context,
+    ).isDartNativeProject(projectRoot);
     final dir = launcher.host.fileSystem.directory(
       paths.join(projectRoot, '.vscode'),
     );
@@ -72,7 +75,11 @@ final class VscodeCommand extends Command<void> {
   }
 
   /// A shim is always ours, so it is overwritten rather than merged.
-  Future<void> _writeShim(Directory dir, String fileName, String template) async {
+  Future<void> _writeShim(
+    Directory dir,
+    String fileName,
+    String template,
+  ) async {
     final exe = launcher.resolve(subcommand: 'vscode', brokenFeature: 'F5');
     final shim = launcher.host.fileSystem.file(
       launcher.host.paths.context.join(dir.path, fileName),

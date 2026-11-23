@@ -1,9 +1,10 @@
 import 'dart:convert';
 import 'dart:io';
 
-import 'package:cli_kit/cli_kit.dart';
+import 'package:cli_kit/shared/logging/logging.dart';
+import 'package:meta/meta.dart';
 import 'package:path/path.dart' as p;
-import 'package:xcross/src/flutter/models/flutter/dart_defines.dart';
+import 'package:xcross/src/shared/flutter/models/flutter/dart_defines.dart';
 
 /// Defines `dn build bundle` injects into every kernel compile on top of the
 /// caller's `--dart-define`s: the license from `dn config --license-key` /
@@ -21,6 +22,7 @@ import 'package:xcross/src/flutter/models/flutter/dart_defines.dart';
 /// prints the effective frontend_server command line in plaintext, so
 /// [extractFromBuildLog] scrapes the injected set there. Values are secrets:
 /// never log them (key names only), matching dn's own masking.
+@internal
 abstract final class DnInjectedDefines {
   /// Whether [key] (the part before `=`) is mirrored from dn's injection.
   static bool isMirrored(String key) =>
@@ -90,7 +92,7 @@ abstract final class DnInjectedDefines {
   static String cachePath(String projectRoot) =>
       p.join(projectRoot, 'build', '.dn-injected-defines.json');
 
-  static List<String> readCache(String projectRoot) {
+  static List<String> readCache(String projectRoot, {required Log log}) {
     try {
       final file = File(cachePath(projectRoot));
       if (!file.existsSync()) return const [];
@@ -98,21 +100,22 @@ abstract final class DnInjectedDefines {
       if (decoded is! List) return const [];
       return decoded.whereType<String>().toList();
     } on Object catch (e) {
-      Log.logTrace('dn injected-defines cache unreadable: $e');
+      log.logTrace('dn injected-defines cache unreadable: $e');
       return const [];
     }
   }
 
   static Future<void> writeCache(
     String projectRoot,
-    List<String> defines,
-  ) async {
+    List<String> defines, {
+    required Log log,
+  }) async {
     try {
       final file = File(cachePath(projectRoot));
       await file.parent.create(recursive: true);
       await file.writeAsString(jsonEncode(defines));
     } on Object catch (e) {
-      Log.logTrace('dn injected-defines cache unwritable: $e');
+      log.logTrace('dn injected-defines cache unwritable: $e');
     }
   }
 }

@@ -13,7 +13,9 @@ const String promptErrorsSetting = 'dart.promptToRunIfErrors';
 /// Shim file names (under `.vscode/`). The Flutter-adapter shim serves
 /// `dart.customFlutterDapPath`; the Dart-adapter shim serves
 /// `dart.customDartDapPath` for DartNative projects (see above).
+@internal
 const String xcrossDapFile = 'xcross_dap.dart';
+@internal
 const String dartDapFile = 'xcross_dart_dap.dart';
 
 /// Marks a launch config as xcross-owned. Carried in the config's `env` (a
@@ -27,7 +29,9 @@ const String xcrossEnvValue = 'true';
 /// DN workspaces as Dart-only (their pubspecs never reference `flutter`, so
 /// `debuggerType: flutter` entries are rejected outright), therefore DN
 /// launches go through the Dart adapter slot instead of the Flutter one.
+@internal
 const String dartDapPathSetting = 'dart.customDartDapPath';
+@internal
 const String dartDapPathValue = '.vscode/xcross_dart_dap.dart';
 
 /// JSONC parse/merge helpers for VS Code launch.json / settings.json.

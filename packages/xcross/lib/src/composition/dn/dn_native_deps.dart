@@ -1,11 +1,10 @@
 import 'dart:io';
 
 import 'package:archive/archive_io.dart';
-import 'package:cli_kit/cli_kit.dart';
-import 'package:darwin_sdk_kit/darwin_sdk_kit.dart';
+import 'package:meta/meta.dart';
 import 'package:path/path.dart' as p;
-import 'package:xcross/src/cli/basic/sdk_install.dart';
-import 'package:xcross/src/flutter/errors.dart';
+import 'package:xcross/src/composition/dn/dn_context.dart';
+import 'package:xcross/src/shared/flutter/errors.dart';
 
 /// Fetches and cross-builds the third-party native dependencies of the
 /// DartNative iOS runtime that CocoaPods would otherwise vendor on macOS.
@@ -17,6 +16,7 @@ import 'package:xcross/src/flutter/errors.dart';
 /// FlexLayout (Swift) targets, so a plain `swift build` with the xcross
 /// Darwin Swift SDK produces the objects; the paths are handed to
 /// `DnRunnerShim`, which links them straight into `Runner`.
+@internal
 abstract final class DnNativeDeps {
   /// Pinned FlexLayout version matching `dartnative_ios.podspec`.
   static const flexLayoutVersion = '2.0.10';
@@ -35,7 +35,7 @@ abstract final class DnNativeDeps {
   /// Downloads + builds on first use; reuses the cache afterwards. Throws
   /// [FlutterBuildError] when the Swift cross-toolchain is unusable.
   static Future<List<String>> ensureBuilt({
-    required DarwinSdk sdk,
+    required DnContext context,
     String? cacheRoot,
   }) async {
     final dir = cacheDir(cacheRoot: cacheRoot);
@@ -45,8 +45,8 @@ abstract final class DnNativeDeps {
       if (cached.isNotEmpty) return cached;
     }
 
-    await _fetchSources(dir);
-    await _swiftBuild(sdk: sdk, dir: dir);
+    await _fetchSources(context, dir);
+    await _swiftBuild(context, dir);
 
     final objects = _collectObjects(dir);
     if (objects.isEmpty) {
@@ -61,51 +61,53 @@ abstract final class DnNativeDeps {
   static String get _marker => 'flexlayout-$flexLayoutVersion-evo-ok';
 
   /// Download + extract the FlexLayout sources (skipped when present).
-  static Future<void> _fetchSources(String dir) async {
+  static Future<void> _fetchSources(DnContext context, String dir) async {
     final packageDir = p.join(dir, 'FlexLayout-$flexLayoutVersion');
     if (Directory(p.join(packageDir, 'Sources')).existsSync()) return;
     await Directory(dir).create(recursive: true);
     final tmp = await Directory.systemTemp.createTemp('dn-flexlayout-');
     try {
       final tarball = File(p.join(tmp.path, 'flex.tar.gz'));
-      await Downloader.downloadToFile(
+      await context.downloader.downloadToFile(
         _tarballUrl,
         tarball,
         maxAttempts: 5,
         label: 'FlexLayout $flexLayoutVersion',
       );
-      await Log.logStep(
-        'Extracting FlexLayout',
-        () async {
-          final bytes = await tarball.readAsBytes();
-          final archive = TarDecoder().decodeBytes(
-            const GZipDecoder().decodeBytes(bytes),
-          );
-          await extractArchiveToDisk(archive, dir);
-        },
-      );
+      await context.log.logStep('Extracting FlexLayout', () async {
+        final bytes = await tarball.readAsBytes();
+        final archive = TarDecoder().decodeBytes(
+          const GZipDecoder().decodeBytes(bytes),
+        );
+        await extractArchiveToDisk(archive, dir);
+      });
     } finally {
       await tmp.delete(recursive: true);
     }
   }
 
   /// Cross-build the package with the host Swift + xcross Darwin Swift SDK.
-  static Future<void> _swiftBuild({
-    required DarwinSdk sdk,
-    required String dir,
-  }) async {
-    final mismatch = await SdkInstall.hostToolchainMismatch(sdk.swiftSdkPath);
+  static Future<void> _swiftBuild(DnContext context, String dir) async {
+    final sdk = context.requireSdk();
+    final iosSdk = context.requireIosSdk();
+    final mismatch = await context.sdkInstall.hostToolchainMismatch(
+      sdk.swiftSdkPath,
+    );
     if (mismatch != null) {
-      throw FlutterBuildError(SdkInstall.mismatchGuidance(mismatch));
+      throw FlutterBuildError(
+        context.sdkInstall.swiftInstallGuidance.isEmpty
+            ? 'DnNativeDeps: host Swift toolchain does not match the '
+                  'installed Darwin SDK ($mismatch).'
+            : context.sdkInstall.swiftInstallGuidance,
+      );
     }
-    final swift = await ProcessRunner.locateTool('swift');
+    final swift = await context.runner.which('swift');
     final packageDir = p.join(dir, 'FlexLayout-$flexLayoutVersion');
     final scratch = p.join(dir, 'scratch');
-    final iosSdk = sdk.iPhoneOSSdk();
-    await Log.logStep(
+    await context.log.logStep(
       'Building FlexLayout $flexLayoutVersion',
-      () => ProcessRunner.runChecked(
-        swift,
+      () => context.runner.runChecked(
+        swift!,
         [
           'build',
           '--package-path',
@@ -137,7 +139,7 @@ abstract final class DnNativeDeps {
           '-Xcc',
           iosSdk,
         ],
-        inheritStdio: Log.isVerbose,
+        inheritStdio: context.log.isVerbose,
         label: 'swift build',
       ),
     );
@@ -146,7 +148,9 @@ abstract final class DnNativeDeps {
   /// Every built target object, excluding test targets.
   static List<String> _collectObjects(String dir) {
     final objects = <String>[];
-    final release = Directory(p.join(dir, 'scratch', 'arm64-apple-ios', 'release'));
+    final release = Directory(
+      p.join(dir, 'scratch', 'arm64-apple-ios', 'release'),
+    );
     if (!release.existsSync()) return const [];
     for (final entity in release.listSync(recursive: true)) {
       if (entity is! File || p.extension(entity.path) != '.o') continue;

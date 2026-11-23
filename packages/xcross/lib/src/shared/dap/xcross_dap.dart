@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:cli_kit/shared/platform/platform_host.dart';
 import 'package:cli_kit/shared/process/process.dart';
 import 'package:dart_mobile_device/shared/tunnel/tunnel_availability.dart';
 import 'package:dds/dap.dart';
@@ -9,8 +10,8 @@ import 'package:frontend_server_kit/shared/compiler/package_uris.dart';
 import 'package:meta/meta.dart';
 import 'package:pure/pure.dart';
 import 'package:vm_service/vm_service.dart' as vm;
-import 'package:xcross/src/dn/dn_project.dart';
 import 'package:xcross/src/shared/dap/dap_child_controller.dart';
+import 'package:xcross/src/shared/dn/dn_project_detector.dart';
 import 'package:xcross/src/shared/flutter/models/flutter/flutter_build_mode.dart';
 import 'package:xcross/src/shared/packages/package_config_resolver.dart';
 import 'package:xcross/src/shared/runtime/constants.dart';
@@ -136,7 +137,12 @@ final class XcrossDap
         : program;
     return runner.start(
       launcher,
-      runArguments(cwd: cwd, target: target, args: launchArgs.args),
+      runArguments(
+        host: runner.host,
+        cwd: cwd,
+        target: target,
+        args: launchArgs.args,
+      ),
       workingDirectory: cwd,
       environment: {...?launchArgs.env, 'PWD': cwd, 'XCROSS_DAP': '1'},
     );
@@ -148,11 +154,18 @@ final class XcrossDap
   /// the same `.vscode/launch.json` entry drives either project kind.
   @visibleForTesting
   static List<String> runArguments({
+    required PlatformHostInterface host,
     required String cwd,
     required String target,
     List<String>? args,
   }) => [
-    if (DnProject.isDartNativeProject(cwd)) 'dn' else 'flutter',
+    if (DnProjectDetector(
+      host.fileSystem,
+      host.paths.context,
+    ).isDartNativeProject(cwd))
+      'dn'
+    else
+      'flutter',
     'run',
     '--target',
     target,

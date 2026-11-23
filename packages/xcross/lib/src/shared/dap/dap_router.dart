@@ -35,6 +35,7 @@ abstract final class DapSession {
     String? flutterTool,
     bool declarative = false,
     bool testAdapter = false,
+    bool dartShimmed = false,
     List<String> flutterAdapterArguments = const [],
   }) {
     return DapRouter(
@@ -48,6 +49,7 @@ abstract final class DapSession {
       flutterTool: flutterTool,
       declarative: declarative,
       testAdapter: testAdapter,
+      dartShimmed: dartShimmed,
       flutterAdapterArguments: flutterAdapterArguments,
     ).run();
   }

@@ -2,8 +2,10 @@ import 'dart:io';
 
 import 'package:path/path.dart' as p;
 import 'package:test/test.dart';
-import 'package:xcross/src/dn/dn_engine_cache.dart';
-import 'package:xcross/src/errors.dart';
+import 'package:xcross/src/composition/dn/dn_engine_cache.dart';
+import 'package:xcross/src/shared/errors/errors.dart';
+
+import '../cli/runtime_fixture.dart';
 
 void main() {
   group('DnEngineCache', () {
@@ -12,7 +14,7 @@ void main() {
       try {
         final dn = File(p.join(dir.path, 'zero', 'bin', 'dn'))
           ..createSync(recursive: true);
-        final cache = DnEngineCache(dnExecutable: dn.path);
+        final cache = DnEngineCache(dn.path, runner: testRuntime().runner);
         expect(cache.dnRoot, p.join(dir.path, 'zero'));
         expect(
           cache.flutterXcframework,
@@ -37,7 +39,7 @@ void main() {
       try {
         final dn = File(p.join(dir.path, 'zero', 'bin', 'dn'))
           ..createSync(recursive: true);
-        final cache = DnEngineCache(dnExecutable: dn.path);
+        final cache = DnEngineCache(dn.path, runner: testRuntime().runner);
         expect(
           () => cache.flutterDeviceFramework,
           throwsA(
@@ -72,7 +74,7 @@ void main() {
         )..createSync(recursive: true);
         final dn = File(p.join(dir.path, 'zero', 'bin', 'dn'))
           ..createSync(recursive: true);
-        final cache = DnEngineCache(dnExecutable: dn.path);
+        final cache = DnEngineCache(dn.path, runner: testRuntime().runner);
         expect(cache.flutterDeviceFramework, framework.path);
       } finally {
         dir.deleteSync(recursive: true);

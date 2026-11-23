@@ -1,7 +1,9 @@
 import 'dart:io';
 
 import 'package:test/test.dart';
-import 'package:xcross/src/dn/dn_injected_defines.dart';
+import 'package:xcross/src/composition/dn/dn_injected_defines.dart';
+
+import '../log_fixture.dart';
 
 const _frontendLine =
     '[   +4 ms] /home/u/zero/bin/cache/dart-sdk/bin/dartaotruntime '
@@ -21,18 +23,15 @@ const _frontendLine =
 void main() {
   group('DnInjectedDefines.extractFromBuildLog', () {
     test('scrapes license and FLUTTER_* flags, skips toolchain flags', () {
-      expect(
-        DnInjectedDefines.extractFromBuildLog(_frontendLine),
-        [
-          'DN_LICENSE_KEY=dnk_testkey0123456789abcdef0000000000',
-          'FLUTTER_VERSION=3.45.0-0.1.pre',
-          'FLUTTER_CHANNEL=stable',
-          'FLUTTER_GIT_URL=unknown source',
-          'FLUTTER_FRAMEWORK_REVISION=fe815c53cd',
-          'FLUTTER_ENGINE_REVISION=2baa73665c',
-          'FLUTTER_DART_VERSION=3.12.0 (build 3.12.0-192.0.dev)',
-        ],
-      );
+      expect(DnInjectedDefines.extractFromBuildLog(_frontendLine), [
+        'DN_LICENSE_KEY=dnk_testkey0123456789abcdef0000000000',
+        'FLUTTER_VERSION=3.45.0-0.1.pre',
+        'FLUTTER_CHANNEL=stable',
+        'FLUTTER_GIT_URL=unknown source',
+        'FLUTTER_FRAMEWORK_REVISION=fe815c53cd',
+        'FLUTTER_ENGINE_REVISION=2baa73665c',
+        'FLUTTER_DART_VERSION=3.12.0 (build 3.12.0-192.0.dev)',
+      ]);
     });
 
     test('ignores non-frontend_server lines and user -D args elsewhere', () {
@@ -41,10 +40,9 @@ void main() {
           'some other line -DFLUTTER_VERSION=9.9.9\n'
           '$_frontendLine\n';
       final found = DnInjectedDefines.extractFromBuildLog(log);
-      expect(
-        found.where((d) => d.startsWith('FLUTTER_VERSION=')),
-        ['FLUTTER_VERSION=3.45.0-0.1.pre'],
-      );
+      expect(found.where((d) => d.startsWith('FLUTTER_VERSION=')), [
+        'FLUTTER_VERSION=3.45.0-0.1.pre',
+      ]);
       expect(found.any((d) => d.startsWith('A=')), isFalse);
     });
 
@@ -62,10 +60,10 @@ void main() {
           'x dartaotruntime frontend_server_aot.dart.snapshot '
           '-DDART_NATIVE_LICENSE_TOKEN=eyABC123 -DDN_TRIAL_ENDED=true '
           '--output-dill out/app.dill';
-      expect(
-        DnInjectedDefines.extractFromBuildLog(log),
-        ['DART_NATIVE_LICENSE_TOKEN=eyABC123', 'DN_TRIAL_ENDED=true'],
-      );
+      expect(DnInjectedDefines.extractFromBuildLog(log), [
+        'DART_NATIVE_LICENSE_TOKEN=eyABC123',
+        'DN_TRIAL_ENDED=true',
+      ]);
     });
   });
 
@@ -85,12 +83,16 @@ void main() {
     test('roundtrips through the cache file', () async {
       final project = Directory.systemTemp.createTempSync('dn-defines-');
       try {
-        expect(DnInjectedDefines.readCache(project.path), isEmpty);
-        await DnInjectedDefines.writeCache(project.path, ['DN_LICENSE_KEY=k']);
         expect(
-          DnInjectedDefines.readCache(project.path),
-          ['DN_LICENSE_KEY=k'],
+          DnInjectedDefines.readCache(project.path, log: testLog()),
+          isEmpty,
         );
+        await DnInjectedDefines.writeCache(project.path, [
+          'DN_LICENSE_KEY=k',
+        ], log: testLog());
+        expect(DnInjectedDefines.readCache(project.path, log: testLog()), [
+          'DN_LICENSE_KEY=k',
+        ]);
         expect(
           File(DnInjectedDefines.cachePath(project.path)).existsSync(),
           isTrue,

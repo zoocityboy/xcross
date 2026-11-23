@@ -1,12 +1,14 @@
 import 'dart:io';
 
-import 'package:cli_kit/cli_kit.dart';
-import 'package:darwin_sdk_kit/darwin_sdk_kit.dart';
+import 'package:darwin_sdk_kit/shared/sdk/darwin_sdk.dart';
+import 'package:darwin_sdk_kit/shared/tbd/tbd_linker_diagnostic.dart';
+import 'package:darwin_sdk_kit/target/iphone/iphone_build_platform.dart';
 import 'package:meta/meta.dart';
 import 'package:path/path.dart' as p;
-import 'package:xcross/src/dn/dn_engine_cache.dart';
-import 'package:xcross/src/flutter/build/ios_deployment_target.dart';
-import 'package:xcross/src/flutter/errors.dart';
+import 'package:xcross/src/composition/dn/dn_context.dart';
+import 'package:xcross/src/composition/dn/dn_engine_cache.dart';
+import 'package:xcross/src/shared/flutter/errors.dart';
+import 'package:xcross/src/shared/swiftpm/ios_deployment_target.dart';
 
 /// Builds the `Runner` executable for a DartNative iOS `.app`.
 ///
@@ -17,6 +19,7 @@ import 'package:xcross/src/flutter/errors.dart';
 /// only names the app delegate — the classes come from the
 /// statically-linked `dartnative_ios` object, and the scene manifest in
 /// `Info.plist` must name the scene delegate (see `DnPackOperation`).
+@internal
 final class DnRunnerShim {
   /// ObjC runtime names of the native runtime's delegate classes.
   ///
@@ -29,6 +32,7 @@ final class DnRunnerShim {
       '_TtC14dartnative_ios21DartNativeAppDelegate';
   static const sceneDelegateClassName =
       '_TtC14dartnative_ios23DartNativeSceneDelegate';
+
   /// Compile and link the Runner binary.
   ///
   /// [dnEngine] provides the DartNative SDK paths (engine + binding
@@ -39,19 +43,19 @@ final class DnRunnerShim {
   ///
   /// Returns path to the linked `Runner` executable.
   static Future<String> buildRunnerBinary({
-    required String projectRoot,
-    required DarwinSdk sdk,
+    required DnContext context,
     required DnEngineCache dnEngine,
     required String flutterXcframework,
     required String outputDir,
     required IosDeploymentTarget deploymentTarget,
     List<String> nativeObjects = const [],
     bool verbose = false,
-  }) => Log.logStep('Compiling DN Runner', () async {
-    final clang = await DarwinSdk.resolveDarwinClang(sdk);
-    final iosSdk = _resolveIPhoneOsSDK(sdk);
-    final compilerRt = compilerRtIos(sdk.bundle);
-    final swiftIphoneosLibDir = _swiftIphoneosLibDir(sdk.bundle);
+  }) => context.log.logStep('Compiling DN Runner', () async {
+    final sdk = context.requireSdk();
+    final iosSdk = _resolveIPhoneOsSDK(context, sdk);
+    final clang = await context.toolchainResolver.resolveDarwinClang(iosSdk);
+    final compilerRt = compilerRtIos(sdk.swiftSdkPath);
+    final swiftIphoneosLibDir = _swiftIphoneosLibDir(sdk.swiftSdkPath);
     final flutterSlice = _deviceSlice(
       flutterXcframework,
       p.join('Flutter.framework'),
@@ -69,12 +73,10 @@ final class DnRunnerShim {
     final objectPath = p.join(outputDir, 'Runner.o');
     final outputPath = p.join(outputDir, 'Runner');
 
-    await File(sourcePath).writeAsString(
-      runnerObjcSource(verbose: verbose),
-    );
+    await File(sourcePath).writeAsString(runnerObjcSource(verbose: verbose));
 
-    Log.logTrace('[clang] compile Runner.m → Runner.o');
-    await ProcessRunner.runChecked(
+    context.log.logTrace('[clang] compile Runner.m → Runner.o');
+    await context.runner.runChecked(
       clang,
       compileArguments(
         sourcePath: sourcePath,
@@ -84,17 +86,17 @@ final class DnRunnerShim {
         flutterSlice: flutterSlice,
         deploymentTarget: deploymentTarget,
       ),
-      inheritStdio: Log.isVerbose,
+      inheritStdio: context.log.isVerbose,
       label: 'clang',
     );
 
     final sdkVersion = _sdkVersion(iosSdk) ?? '26.5';
-    final ld64lld = await DarwinSdk.resolveLd64Lld(sdk);
-    Log.logTrace('[ld64.lld] link Runner.o + dartnative_ios → Runner');
+    final ld64lld = await context.toolchainResolver.resolveLd64Lld();
+    context.log.logTrace('[ld64.lld] link Runner.o + dartnative_ios → Runner');
     await TbdLinkerDiagnostic.explainFailures(
       bundle: sdk.swiftSdkPath,
       wrap: FlutterBuildError.new,
-      () => ProcessRunner.runChecked(
+      () => context.runner.runChecked(
         ld64lld,
         linkArguments(
           objectPath: objectPath,
@@ -109,7 +111,7 @@ final class DnRunnerShim {
           compilerRt: compilerRt,
           swiftIphoneosLibDir: swiftIphoneosLibDir,
         ),
-        inheritStdio: Log.isVerbose,
+        inheritStdio: context.log.isVerbose,
         label: 'ld64.lld',
       ),
     );
@@ -121,9 +123,11 @@ final class DnRunnerShim {
       );
     }
 
-    ProcessRunner.makeExecutable(outputPath);
+    context.runner.makeExecutable(outputPath);
     final size = await File(outputPath).length();
-    Log.logTrace('DN Runner binary produced: $outputPath (${size ~/ 1024} KB)');
+    context.log.logTrace(
+      'DN Runner binary produced: $outputPath (${size ~/ 1024} KB)',
+    );
 
     return outputPath;
   });
@@ -219,7 +223,7 @@ final class DnRunnerShim {
     // Apple's clang driver links the platform compiler-rt implicitly;
     // ld64.lld does not. It provides ___isPlatformVersionAtLeast among
     // other runtime helpers.
-    if (compilerRt != null) compilerRt,
+    ?compilerRt,
     // Swift backward-compatibility archives (Xcode links them via the
     // toolchain's own search path; ld64.lld needs the explicit -L/-l).
     // They provide the __swift_FORCE_LOAD_$ compatibility shims the
@@ -272,9 +276,9 @@ final class DnRunnerShim {
   ];
 
   /// Prefer the generic `iPhoneOS.sdk` symlink; fall back to the versioned SDK.
-  static String _resolveIPhoneOsSDK(DarwinSdk sdk) {
+  static String _resolveIPhoneOsSDK(DnContext context, DarwinSdk sdk) {
     final generic = p.join(
-      sdk.bundle,
+      sdk.swiftSdkPath,
       'Developer',
       'Platforms',
       'iPhoneOS.platform',
@@ -283,7 +287,10 @@ final class DnRunnerShim {
       'iPhoneOS.sdk',
     );
     if (Directory(generic).existsSync()) return generic;
-    return sdk.iPhoneOSSdk();
+    return context.sdkRepository.iosSdk(
+      sdk,
+      target: const IPhoneBuildPlatform(),
+    );
   }
 
   /// Returns the `ios-arm64` slice directory inside [xcframework].
@@ -330,7 +337,12 @@ final class DnRunnerShim {
     final versions = clang.listSync().whereType<Directory>().toList()
       ..sort((a, b) => b.path.compareTo(a.path));
     for (final entry in versions) {
-      final candidate = p.join(entry.path, 'lib', 'darwin', 'libclang_rt.ios.a');
+      final candidate = p.join(
+        entry.path,
+        'lib',
+        'darwin',
+        'libclang_rt.ios.a',
+      );
       if (File(candidate).existsSync()) return candidate;
     }
     return null;
@@ -367,7 +379,8 @@ final class DnRunnerShim {
   /// `LaunchScreen` name is rescued — every other missing storyboard
   /// still throws.
   @visibleForTesting
-  static String runnerObjcSource({required bool verbose}) => '''
+  static String runnerObjcSource({required bool verbose}) =>
+      '''
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 

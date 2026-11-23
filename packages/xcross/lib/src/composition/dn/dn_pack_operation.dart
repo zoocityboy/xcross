@@ -1,44 +1,56 @@
 import 'dart:io';
 
-import 'package:cli_kit/cli_kit.dart';
-import 'package:darwin_sdk_kit/darwin_sdk_kit.dart';
+import 'package:darwin_sdk_kit/target/iphone/iphone_build_platform.dart';
+import 'package:meta/meta.dart';
 import 'package:path/path.dart' as p;
-import 'package:xcross/src/dn/dn_asset_catalog.dart';
-import 'package:xcross/src/dn/dn_build_options.dart';
-import 'package:xcross/src/dn/dn_engine_cache.dart';
-import 'package:xcross/src/dn/dn_injected_defines.dart';
-import 'package:xcross/src/dn/dn_native_deps.dart';
-import 'package:xcross/src/dn/dn_project.dart';
-import 'package:xcross/src/dn/dn_runner_shim.dart';
-import 'package:xcross/src/errors.dart';
-import 'package:xcross/src/flutter/build/flutter_debug_bundler.dart';
-import 'package:xcross/src/flutter/build/info_plist.dart';
-import 'package:xcross/src/flutter/build/internal/recursive_directory_copy.dart';
-import 'package:xcross/src/flutter/build/internal/toolchain.dart';
-import 'package:xcross/src/flutter/build/ios_bundle_id.dart';
-import 'package:xcross/src/flutter/build/ios_bundle_resources.dart';
-import 'package:xcross/src/flutter/build/ios_bundle_versions.dart';
-import 'package:xcross/src/flutter/build/ios_deployment_target.dart';
-import 'package:xcross/src/flutter/constants.dart';
-import 'package:xcross/src/flutter/errors.dart';
-import 'package:xcross/src/flutter/models/pubspec_info.dart';
-import 'package:xcross/src/models/pack_result.dart';
+import 'package:xcross/src/composition/dn/dn_asset_catalog.dart';
+import 'package:xcross/src/composition/dn/dn_context.dart';
+import 'package:xcross/src/composition/dn/dn_engine_cache.dart';
+import 'package:xcross/src/composition/dn/dn_info_plist.dart';
+import 'package:xcross/src/composition/dn/dn_injected_defines.dart';
+import 'package:xcross/src/composition/dn/dn_native_deps.dart';
+import 'package:xcross/src/composition/dn/dn_project.dart';
+import 'package:xcross/src/composition/dn/dn_runner_shim.dart';
+import 'package:xcross/src/shared/artifact/plist_mutations.dart';
+import 'package:xcross/src/shared/artifact/plist_storyboard_policy.dart';
+import 'package:xcross/src/shared/errors/errors.dart';
+import 'package:xcross/src/shared/flutter/build/flutter_debug_bundler.dart';
+import 'package:xcross/src/shared/flutter/build/info_plist.dart';
+import 'package:xcross/src/shared/flutter/build/internal/toolchain.dart';
+import 'package:xcross/src/shared/flutter/build/ios_bundle_id.dart';
+import 'package:xcross/src/shared/flutter/build/ios_bundle_resources.dart';
+import 'package:xcross/src/shared/flutter/build/ios_bundle_versions.dart';
+import 'package:xcross/src/shared/flutter/constants.dart';
+import 'package:xcross/src/shared/flutter/errors.dart';
+import 'package:xcross/src/shared/flutter/models/flutter/dart_defines.dart';
+import 'package:xcross/src/shared/flutter/models/flutter/flutter_build_options.dart';
+import 'package:xcross/src/shared/flutter/project/ios_bundle_versions_resolver.dart';
+import 'package:xcross/src/shared/flutter/project/ios_deployment_target_resolver.dart';
+import 'package:xcross/src/shared/flutter/project/pbx_project_reader.dart';
+import 'package:xcross/src/shared/flutter/project/pubspec_info_reader.dart';
+import 'package:xcross/src/shared/models/pack_result.dart';
+import 'package:xcross/src/shared/swiftpm/ios_deployment_target.dart';
+import 'package:xcross/src/shared/swiftpm/recursive_directory_copy.dart';
 
 /// Builds a DartNative iOS `.app` on any host with a Darwin SDK, mirroring
-/// [FlutterPackOperation]: the Dart kernel/assets come from
+/// the Flutter pipeline: the Dart kernel/assets come from
 /// `dn build bundle` (which runs on Linux), the `Runner` binary is compiled
 /// with the xcross cross-toolchain, and the bundle is assembled into
 /// `build/xcross-ios/<appName>.app`.
 ///
 /// Debug/JIT only — signing happens later in `DeviceRunOperation`, exactly
 /// like the Flutter path.
+@internal
 abstract final class DnPackOperation {
   /// Build the DartNative iOS app, optionally overriding the resolved id.
   static Future<PackResult> pack({
-    required DnBuildOptions options,
+    required DnContext context,
+    required FlutterBuildOptions options,
     String? bundleIdOverride,
   }) async {
-    final projectRoot = Directory.current.path;
+    final projectRoot = context.projectRoot;
+    final paths = context.paths;
+    final fs = context.host.fileSystem;
     if (!DnProject.isDartNativeProject(projectRoot)) {
       throw XcrossError(
         '$projectRoot is not a DartNative project '
@@ -55,43 +67,47 @@ abstract final class DnPackOperation {
       );
     }
 
-    final appName = PubspecInfo.loadSync(projectRoot).name;
+    final projects = PbxProjectReader(fs, paths);
+    final appName = PubspecInfoReader(fs, paths).loadSync(projectRoot).name;
     final bundleId = bundleIdOverride?.isNotEmpty == true
         ? bundleIdOverride!
-        : _resolveBundleId(projectRoot);
-    final deploymentTarget = IosDeploymentTarget.resolve(projectRoot);
-    Log.logTrace('iOS deployment target: ${deploymentTarget.version}');
-    final versions = IosBundleVersions.resolve(
+        : _resolveBundleId(projectRoot, IosBundleId(fs, paths, projects));
+    final deploymentTarget = IosDeploymentTargetResolver(
+      fs,
+      paths,
+    ).resolve(projectRoot, platform: const IPhoneBuildPlatform());
+    context.log.logTrace('iOS deployment target: ${deploymentTarget.version}');
+    final versions = IosBundleVersionsResolver(fs, projects).resolve(
       projectRoot,
       buildName: options.buildName,
       buildNumber: options.buildNumber,
     );
 
     final bundle = await _buildDnBundle(
+      context: context,
       dn: dn,
-      projectRoot: projectRoot,
       options: options,
     );
     final assetDir = bundle.assetDir;
 
-    final engineCache = DnEngineCache(dnExecutable: dn);
-    await Log.logStep(
+    final engineCache = DnEngineCache(dn, runner: context.runner);
+    await context.log.logStep(
       'Fetching DartNative iOS engine',
       engineCache.ensureArtifactsAvailable,
     );
 
     final appFramework = await _buildAppFramework(
-      projectRoot: projectRoot,
+      context: context,
       assetDir: assetDir,
       deploymentTarget: deploymentTarget,
     );
     final runnerBinary = await _buildRunnerBinary(
-      projectRoot: projectRoot,
+      context: context,
       engineCache: engineCache,
       deploymentTarget: deploymentTarget,
     );
     final appPath = await _assembleBundle(
-      projectRoot: projectRoot,
+      context: context,
       appName: appName,
       bundleId: bundleId,
       versions: versions,
@@ -104,13 +120,18 @@ abstract final class DnPackOperation {
       outputPath: appPath,
       bundleId: bundleId,
       projectRoot: projectRoot,
-      injectedDefines: bundle.injectedDefines,
+      dartDefines: bundle.injectedDefines.isEmpty
+          ? options.dartDefines
+          : DartDefines.mergeFallback(
+              base: options.dartDefines,
+              fallback: bundle.injectedDefines,
+            ),
     );
   }
 
-  static String _resolveBundleId(String projectRoot) {
+  static String _resolveBundleId(String projectRoot, IosBundleId bundleIds) {
     try {
-      return IosBundleId.resolve(projectRoot);
+      return bundleIds.resolve(projectRoot);
     } on FlutterBuildError catch (e) {
       throw XcrossError(
         'Could not resolve iOS bundle identifier: ${e.message} '
@@ -129,10 +150,11 @@ abstract final class DnPackOperation {
   /// run's cache fills in.
   static Future<({String assetDir, List<String> injectedDefines})>
   _buildDnBundle({
+    required DnContext context,
     required String dn,
-    required String projectRoot,
-    required DnBuildOptions options,
-  }) => Log.logStep('Building Dart bundle', () async {
+    required FlutterBuildOptions options,
+  }) => context.log.logStep('Building Dart bundle', () async {
+    final projectRoot = context.projectRoot;
     final assetDir = p.join(
       projectRoot,
       'build',
@@ -143,12 +165,12 @@ abstract final class DnPackOperation {
     if (dir.existsSync()) await dir.delete(recursive: true);
     await dir.create(recursive: true);
 
-    final result = await ProcessRunner.run(
+    final result = await context.runner.run(
       dn,
       bundleArgs(options: options, assetDir: assetDir),
       workingDirectory: projectRoot,
     );
-    if (Log.isVerbose) {
+    if (context.log.isVerbose) {
       stdout.write(result.stdout);
       stderr.write(result.stderr);
     }
@@ -169,16 +191,20 @@ abstract final class DnPackOperation {
     );
     if (injected.isNotEmpty) {
       // Key names only: values are secrets (dn masks them everywhere).
-      Log.logTrace(
+      context.log.logTrace(
         'dn injected defines: '
         '${[for (final d in injected) DnInjectedDefines.keyOf(d)]}',
       );
-      await DnInjectedDefines.writeCache(projectRoot, injected);
+      await DnInjectedDefines.writeCache(
+        projectRoot,
+        injected,
+        log: context.log,
+      );
       return (assetDir: assetDir, injectedDefines: injected);
     }
-    final cached = DnInjectedDefines.readCache(projectRoot);
+    final cached = DnInjectedDefines.readCache(projectRoot, log: context.log);
     if (cached.isNotEmpty) {
-      Log.logTrace(
+      context.log.logTrace(
         'dn skipped the kernel compile; reusing cached injected defines',
       );
     }
@@ -187,12 +213,8 @@ abstract final class DnPackOperation {
 
   /// Effective dart-defines for `dn build bundle`, appending the flavor
   /// define unless the caller already set `FLUTTER_APP_FLAVOR=` explicitly.
-  static List<String> _effectiveDefines(DnBuildOptions options) => [
-    ...options.dartDefines,
-    if (options.flavor != null &&
-        !options.dartDefines.any((d) => d.startsWith('FLUTTER_APP_FLAVOR=')))
-      'FLUTTER_APP_FLAVOR=${options.flavor}',
-  ];
+  static List<String> _effectiveDefines(FlutterBuildOptions options) =>
+      DartDefines.withFlavorDefine(options.dartDefines, options.flavor);
 
   /// Argument list for `dn build bundle --target-platform ios`.
   ///
@@ -200,7 +222,7 @@ abstract final class DnPackOperation {
   /// is the only plaintext source of dn's injected defines (license key,
   /// `FLUTTER_*`), which hot reload mirrors (see [DnInjectedDefines]).
   static List<String> bundleArgs({
-    required DnBuildOptions options,
+    required FlutterBuildOptions options,
     required String assetDir,
   }) => [
     'build',
@@ -212,62 +234,55 @@ abstract final class DnPackOperation {
     'ios',
     '--asset-dir',
     assetDir,
-    if (options.buildNumber != null)
-      '--build-number=${options.buildNumber}',
+    if (options.buildNumber != null) '--build-number=${options.buildNumber}',
     for (final define in _effectiveDefines(options)) ...['-D', define],
     if (!options.pub) '--no-pub',
   ];
 
   /// Stage `App.framework` from the `dn build bundle` assets + a stub dylib.
   static Future<String> _buildAppFramework({
-    required String projectRoot,
+    required DnContext context,
     required String assetDir,
     required IosDeploymentTarget deploymentTarget,
   }) async {
-    final assembleOut = p.join(projectRoot, 'build', 'xcross-dn-debug');
+    final assembleOut = p.join(context.projectRoot, 'build', 'xcross-dn-debug');
     final assembleDir = Directory(assembleOut);
     if (assembleDir.existsSync()) await assembleDir.delete(recursive: true);
     await assembleDir.create(recursive: true);
 
+    final copier = RecursiveDirectoryCopier(
+      fileSystem: context.host.fileSystem,
+      paths: context.paths,
+    );
     final appFramework = p.join(assembleOut, 'App.framework');
-    await Directory(p.join(appFramework, 'flutter_assets')).create(
-      recursive: true,
-    );
-    await copyDirectoryPreservingSymlinks(
-      assetDir,
+    await Directory(
       p.join(appFramework, 'flutter_assets'),
-    );
-    await _buildAppStub(appFramework, deploymentTarget);
-    File(
-      p.join(appFramework, 'Info.plist'),
-    ).writeAsStringSync(
-      FlutterDebugBundler.appFrameworkInfoPlist(deploymentTarget),
+    ).create(recursive: true);
+    await copier.copy(assetDir, p.join(appFramework, 'flutter_assets'));
+    await _buildAppStub(context, appFramework, deploymentTarget);
+    File(p.join(appFramework, 'Info.plist')).writeAsStringSync(
+      FlutterDebugBundler.appFrameworkInfoPlist(deploymentTarget.version),
     );
     return appFramework;
   }
 
   static Future<void> _buildAppStub(
+    DnContext context,
     String appFramework,
     IosDeploymentTarget deploymentTarget,
-  ) => Log.logStep('Building App.framework', () async {
-    final darwin = DarwinSdk.current();
-    if (darwin == null) {
-      throw FlutterBuildError(
-        'DnPackOperation: Darwin SDK not found. '
-        'Install with `xcross sdk install <Xcode.xip|Xcode.app>`.',
-      );
-    }
+  ) => context.log.logStep('Building App.framework', () async {
+    final iosSdk = context.requireIosSdk();
     final toolchain = Toolchain(
-      clang: await DarwinSdk.resolveDarwinClang(darwin),
-      iosSdk: darwin.iPhoneOSSdk(),
-      linker: await DarwinSdk.resolveLd64Lld(darwin),
+      clang: await context.toolchainResolver.resolveDarwinClang(iosSdk),
+      iosSdk: iosSdk,
+      linker: await context.toolchainResolver.resolveLd64Lld(),
     );
     final tmp = await Directory.systemTemp.createTemp('xcross-dn-stub-');
     try {
       final stubSource = p.join(tmp.path, 'debug_app.c');
       await File(stubSource).writeAsString('static const int Moo = 88;\n');
       final outputBinary = p.join(appFramework, 'App');
-      await ProcessRunner.runChecked(
+      await context.runner.runChecked(
         toolchain.clang,
         FlutterDebugBundler.appStubClangArgs(
           toolchain: toolchain,
@@ -275,7 +290,7 @@ abstract final class DnPackOperation {
           outputBinary: outputBinary,
           deploymentTarget: deploymentTarget,
         ),
-        inheritStdio: Log.isVerbose,
+        inheritStdio: context.log.isVerbose,
         label: 'clang',
       );
       if (!File(outputBinary).existsSync()) {
@@ -292,33 +307,25 @@ abstract final class DnPackOperation {
   /// Flutter engine, whose Dart version differs), so the engine always comes
   /// from the `dn` SDK — see [DnEngineCache].
   static Future<String> _buildRunnerBinary({
-    required String projectRoot,
+    required DnContext context,
     required DnEngineCache engineCache,
     required IosDeploymentTarget deploymentTarget,
-    // ignore: unnecessary_async
   }) async {
-    final darwin = DarwinSdk.current();
-    if (darwin == null) {
-      throw FlutterBuildError(
-        'DnPackOperation: Darwin SDK not found. '
-        'Install with `xcross sdk install <Xcode.xip|Xcode.app>`.',
-      );
-    }
-    final nativeObjects = await DnNativeDeps.ensureBuilt(sdk: darwin);
-    return DnRunnerShim.buildRunnerBinary(
-      projectRoot: projectRoot,
-      sdk: darwin,
+    final nativeObjects = await DnNativeDeps.ensureBuilt(context: context);
+    final binary = await DnRunnerShim.buildRunnerBinary(
+      context: context,
       dnEngine: engineCache,
       flutterXcframework: engineCache.flutterXcframework,
-      outputDir: p.join(projectRoot, 'build', 'xcross-dn-runner-bin'),
+      outputDir: p.join(context.projectRoot, 'build', 'xcross-dn-runner-bin'),
       deploymentTarget: deploymentTarget,
       nativeObjects: nativeObjects,
-      verbose: Log.isVerbose,
+      verbose: context.log.isVerbose,
     );
+    return binary;
   }
 
   static Future<String> _assembleBundle({
-    required String projectRoot,
+    required DnContext context,
     required String appName,
     required String bundleId,
     required IosBundleVersions versions,
@@ -327,32 +334,40 @@ abstract final class DnPackOperation {
     required String flutterXcframework,
     required String runnerBinary,
   }) async {
+    final projectRoot = context.projectRoot;
+    final paths = context.paths;
+    final fs = context.host.fileSystem;
+    final copier = RecursiveDirectoryCopier(fileSystem: fs, paths: paths);
     final tmp = await Directory.systemTemp.createTemp('${appName}_app_bundle-');
     try {
       final runnerDest = p.join(tmp.path, 'Runner');
       await File(runnerBinary).copy(runnerDest);
-      ProcessRunner.makeExecutable(runnerDest);
-      await copyDirectoryPreservingSymlinks(
+      context.runner.makeExecutable(runnerDest);
+      await copier.copy(
         p.join(flutterXcframework, 'ios-arm64', 'Flutter.framework'),
         p.join(tmp.path, 'Frameworks', 'Flutter.framework'),
       );
-      await copyDirectoryPreservingSymlinks(
+      await copier.copy(
         appFramework,
         p.join(tmp.path, 'Frameworks', 'App.framework'),
       );
-      await stageIosBundleResources(
-        projectRoot: projectRoot,
-        bundleDir: tmp.path,
-      );
+      final projects = PbxProjectReader(fs, paths);
+      await IosBundleResources(
+        fs,
+        paths,
+        projects,
+        copier: copier,
+      ).stage(projectRoot: projectRoot, bundleDir: tmp.path);
       // actool replacement: compile the asset catalog (icons + launch
       // images) without macOS; the resulting plist keys are merged in
       // _writeInfoPlist below.
       final compiledAssets = await DnAssetCatalog.compile(
         projectRoot: projectRoot,
         bundleDir: tmp.path,
+        log: context.log,
       );
       await _writeInfoPlist(
-        projectRoot: projectRoot,
+        context: context,
         bundleDir: tmp.path,
         bundleId: bundleId,
         versions: versions,
@@ -364,7 +379,7 @@ abstract final class DnPackOperation {
       final destDir = Directory(dest);
       if (destDir.existsSync()) await destDir.delete(recursive: true);
       await Directory(p.dirname(dest)).create(recursive: true);
-      await copyDirectoryPreservingSymlinks(tmp.path, dest);
+      await copier.copy(tmp.path, dest);
       return dest;
     } finally {
       await tmp.delete(recursive: true);
@@ -372,40 +387,41 @@ abstract final class DnPackOperation {
   }
 
   static Future<void> _writeInfoPlist({
-    required String projectRoot,
+    required DnContext context,
     required String bundleDir,
     required String bundleId,
     required IosBundleVersions versions,
     required IosDeploymentTarget deploymentTarget,
     DnCompiledAssets? compiledAssets,
   }) async {
+    final projectRoot = context.projectRoot;
     var plistXml = _loadPlistTemplate(projectRoot);
-    plistXml = InfoPlist.expandXmlVars(
-      plistXml,
-      {
-        'EXECUTABLE_NAME': PlistDefaults.executable,
-        'PRODUCT_NAME': PlistDefaults.executable,
-        'PRODUCT_MODULE_NAME': PlistDefaults.executable,
-        'PRODUCT_BUNDLE_IDENTIFIER': bundleId,
-        'DEVELOPMENT_LANGUAGE': 'en',
-        'FLUTTER_BUILD_NAME': versions.shortVersion,
-        'FLUTTER_BUILD_NUMBER': versions.bundleVersion,
-        'MARKETING_VERSION': versions.shortVersion,
-        'CURRENT_PROJECT_VERSION': versions.bundleVersion,
-        'DN_BUILD_NAME': versions.shortVersion,
-        'DN_BUILD_NUMBER': versions.bundleVersion,
-      },
-    );
+    plistXml = InfoPlist.expandXmlVars(plistXml, {
+      'EXECUTABLE_NAME': PlistDefaults.executable,
+      'PRODUCT_NAME': PlistDefaults.executable,
+      'PRODUCT_MODULE_NAME': PlistDefaults.executable,
+      'PRODUCT_BUNDLE_IDENTIFIER': bundleId,
+      'DEVELOPMENT_LANGUAGE': 'en',
+      'FLUTTER_BUILD_NAME': versions.shortVersion,
+      'FLUTTER_BUILD_NUMBER': versions.bundleVersion,
+      'MARKETING_VERSION': versions.shortVersion,
+      'CURRENT_PROJECT_VERSION': versions.bundleVersion,
+      'DN_BUILD_NAME': versions.shortVersion,
+      'DN_BUILD_NUMBER': versions.bundleVersion,
+    });
     plistXml = InfoPlist.applyIosRequiredKeys(
       plistXml,
       bundleId: bundleId,
       deploymentTarget: deploymentTarget,
     );
     plistXml = InfoPlist.applyDebugVmServiceDiscovery(plistXml);
-    plistXml = InfoPlist.stripUnsatisfiableStoryboards(plistXml, bundleDir);
+    plistXml = PlistStoryboardPolicy(
+      context.host.fileSystem,
+      context.paths,
+    ).stripUnsatisfiableStoryboards(plistXml, bundleDir);
     if (compiledAssets != null) {
       if (compiledAssets.hasIcons) {
-        plistXml = InfoPlist.insertFragment(
+        plistXml = DnInfoPlist.insertFragment(
           plistXml,
           DnAssetCatalog.cfbundleIconsFragment(compiledAssets.iconFiles),
         );
@@ -416,7 +432,7 @@ abstract final class DnPackOperation {
       // scale-aware bundle PNGs via UIImage imageNamed:.
       final splash = compiledAssets.splashImageName;
       if (splash != null) {
-        plistXml = InfoPlist.setUILaunchScreen(plistXml, splash);
+        plistXml = DnInfoPlist.setUILaunchScreen(plistXml, splash);
       }
     }
     // NOTE: no applySceneLifecycle — the DN template already declares its
@@ -428,7 +444,7 @@ abstract final class DnPackOperation {
     // not by a project-local class: point the manifest at it explicitly.
     // (The template value `$(PRODUCT_MODULE_NAME).SceneDelegate` normalizes
     // to a bare `SceneDelegate` that resolves to nothing.)
-    plistXml = InfoPlist.setPlistString(
+    plistXml = PlistMutations.setPlistString(
       plistXml,
       'UISceneDelegateClassName',
       DnRunnerShim.sceneDelegateClassName,

@@ -2,10 +2,10 @@ import 'dart:async';
 import 'dart:io';
 import 'dart:typed_data';
 
+import 'package:cli_kit/shared/platform/platform_host.dart';
 import 'package:cli_kit/shared/process/process.dart';
 import 'package:dds/dap.dart';
 import 'package:meta/meta.dart';
-import 'package:path/path.dart' as p;
 import 'package:xcross/src/shared/dap/dap_router.dart';
 
 /// Stubs the pre-launch DAP handshake, then replays the raw frames into the
@@ -24,6 +24,7 @@ final class DapRouter {
     this.flutterTool,
     this.declarative = false,
     this.testAdapter = false,
+    this.dartShimmed = false,
     List<String> flutterAdapterArguments = const [],
   }) : flutterAdapterArguments = List.unmodifiable(flutterAdapterArguments);
 
@@ -34,6 +35,11 @@ final class DapRouter {
   final String? flutterTool;
   final bool declarative;
   final bool testAdapter;
+
+  /// Whether this session arrived through the `.vscode/xcross_dart_dap.dart`
+  /// shim (DartNative workspace, Dart adapter slot). Injected from the
+  /// composition root instead of reading the environment here.
+  final bool dartShimmed;
   final List<String> flutterAdapterArguments;
 
   String? resolveFlutterExecutable({String? projectRoot}) {
@@ -194,33 +200,30 @@ final class DapRouter {
   /// Sessions the `.vscode/xcross_dart_dap.dart` shim delivered arrived
   /// through the Dart adapter slot (DartNative workspace); their fallback is
   /// the Dart SDK's adapter. Everything else keeps the Flutter fallback.
-  /// The shim marks itself with an explicit environment entry on its own
-  /// spawn, so the marker survives declarative mode (no parent environment).
-  static bool get _dartShimmed =>
-      Platform.environment['XCROSS_DART_SHIM'] == 'true';
-
   Future<bool> _startFallbackAdapter(
     Stream<List<int>> inbound,
     DapResponseFilter outbound,
     Object? launchArgs,
-  ) =>
-      _dartShimmed
-          ? _startDartAdapter(inbound, outbound, launchArgs)
-          : _startFlutterAdapter(inbound, outbound);
+  ) => dartShimmed
+      ? _startDartAdapter(inbound, outbound, launchArgs)
+      : _startFlutterAdapter(inbound, outbound);
 
   /// Resolve the `dart` executable owning the session's own SDK
   /// (`dartSdkPath` in the DAP launch request — the SDK Dart-Code itself
   /// selected), or null when it is missing or has no `bin/dart`.
-  static String? resolveDartExecutable(Object? launchArgs) {
+  static String? resolveDartExecutable(
+    Object? launchArgs, {
+    required PlatformHostInterface host,
+  }) {
     if (launchArgs is Map<Object?, Object?>) {
       final sdkPath = launchArgs['dartSdkPath'];
       if (sdkPath is String && sdkPath.isNotEmpty) {
-        final candidate = p.join(
+        final candidate = host.paths.context.join(
           sdkPath,
           'bin',
-          Platform.isWindows ? 'dart.exe' : 'dart',
+          host.paths.executableName('dart'),
         );
-        if (File(candidate).existsSync()) return candidate;
+        if (host.fileSystem.file(candidate).existsSync()) return candidate;
       }
     }
     return null;
@@ -270,7 +273,7 @@ final class DapRouter {
     DapResponseFilter outbound,
     Object? launchArgs,
   ) async {
-    final dart = resolveDartExecutable(launchArgs);
+    final dart = resolveDartExecutable(launchArgs, host: runner.host);
     if (dart == null) {
       errors.writeln(
         'xcross dap: launch config is missing "env": {"XCROSS": "true"} '

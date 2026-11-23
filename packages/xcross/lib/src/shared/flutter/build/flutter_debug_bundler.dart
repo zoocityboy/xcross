@@ -206,7 +206,6 @@ final class FlutterDebugBundler<T extends PlatformHostInterface> {
       });
 
   /// Build the clang argument list for the App stub dylib.
-  @visibleForTesting
   static List<String> appStubClangArgs({
     required Toolchain toolchain,
     required String stubSource,
@@ -257,7 +256,6 @@ final class FlutterDebugBundler<T extends PlatformHostInterface> {
   /// deployment floor (`FlutterDarwinPlatform.ios.deploymentTarget()`), not
   /// the app's `IPHONEOS_DEPLOYMENT_TARGET`. The engine's `Flutter.framework`
   /// records that same floor, so [minimumOsVersion] comes from it.
-  @visibleForTesting
   static String appFrameworkInfoPlist(String minimumOsVersion) {
     return '<?xml version="1.0" encoding="UTF-8"?>\n'
         '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"'

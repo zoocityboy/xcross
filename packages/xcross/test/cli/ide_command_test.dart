@@ -136,10 +136,7 @@ void main() {
     });
 
     test('omits debuggerType for DartNative projects', () {
-      final doc = VscodeJsonMerge.mergeLaunchDoc(
-        null,
-        flutterDebugger: false,
-      );
+      final doc = VscodeJsonMerge.mergeLaunchDoc(null, flutterDebugger: false);
       final entry = (doc['configurations']! as List).single as Map;
       expect(entry.containsKey('debuggerType'), isFalse);
       expect(entry['env'], {'XCROSS': 'true'});
@@ -147,23 +144,20 @@ void main() {
     });
 
     test('removes a stale flutter debuggerType on a DartNative re-run', () {
-      final doc = VscodeJsonMerge.mergeLaunchDoc(
-        {
-          'version': '0.2.0',
-          'configurations': [
-            {
-              'name': 'xcross: iOS device',
-              'type': 'dart',
-              'request': 'launch',
-              'debuggerType': 'flutter',
-              'program': 'lib/main.dart',
-              'env': {'XCROSS': 'true'},
-              'args': ['--udid', 'ABC'],
-            },
-          ],
-        },
-        flutterDebugger: false,
-      );
+      final doc = VscodeJsonMerge.mergeLaunchDoc({
+        'version': '0.2.0',
+        'configurations': [
+          {
+            'name': 'xcross: iOS device',
+            'type': 'dart',
+            'request': 'launch',
+            'debuggerType': 'flutter',
+            'program': 'lib/main.dart',
+            'env': {'XCROSS': 'true'},
+            'args': ['--udid', 'ABC'],
+          },
+        ],
+      }, flutterDebugger: false);
       final entry = (doc['configurations']! as List).single as Map;
       expect(entry.containsKey('debuggerType'), isFalse);
       expect(entry['args'], ['--udid', 'ABC']);
@@ -193,15 +187,12 @@ void main() {
     });
 
     test('adds the Dart-adapter shim only when requested', () {
+      expect(VscodeJsonMerge.mergeSettingsDoc(null), {
+        dapPathSetting: dapPathValue,
+        promptErrorsSetting: false,
+      });
       expect(
-        VscodeJsonMerge.mergeSettingsDoc(null),
-        {dapPathSetting: dapPathValue, promptErrorsSetting: false},
-      );
-      expect(
-        VscodeJsonMerge.mergeSettingsDoc(
-          null,
-          dartDapPath: dartDapPathValue,
-        ),
+        VscodeJsonMerge.mergeSettingsDoc(null, dartDapPath: dartDapPathValue),
         {
           dapPathSetting: dapPathValue,
           promptErrorsSetting: false,
@@ -325,44 +316,48 @@ void main() {
       );
     });
 
-    test('writes the Dart shim and omits debuggerType in DN projects',
-        () async {
-      File(p.join(temp.path, 'pubspec.yaml')).writeAsStringSync(
-        'name: demo\ndependencies:\n  dartnative: ^1.0.0\n',
-      );
+    test(
+      'writes the Dart shim and omits debuggerType in DN projects',
+      () async {
+        File(p.join(temp.path, 'pubspec.yaml')).writeAsStringSync(
+          'name: demo\ndependencies:\n  dartnative: ^1.0.0\n',
+        );
 
-      await VscodeCommand(
-        XcrossIdeLauncher(
-          host: LinuxHost(currentDirectory: temp.path),
-          log: testLog(),
-          executable: '/test/xcross',
-        ),
-      ).run();
+        await VscodeCommand(
+          XcrossIdeLauncher(
+            host: LinuxHost(currentDirectory: temp.path),
+            log: testLog(),
+            executable: '/test/xcross',
+          ),
+        ).run();
 
-      final dartShim = File(p.join(temp.path, '.vscode', 'xcross_dart_dap.dart'));
-      expect(dartShim.existsSync(), isTrue);
-      expect(
-        File(p.join(temp.path, '.vscode', 'xcross_dap.dart')).existsSync(),
-        isTrue,
-      );
-      final launch =
-          jsonDecode(
-                File(
-                  p.join(temp.path, '.vscode', 'launch.json'),
-                ).readAsStringSync(),
-              )
-              as Map;
-      final entry = (launch['configurations'] as List).single as Map;
-      expect(entry.containsKey('debuggerType'), isFalse);
-      final settings =
-          jsonDecode(
-                File(
-                  p.join(temp.path, '.vscode', 'settings.json'),
-                ).readAsStringSync(),
-              )
-              as Map;
-      expect(settings[dartDapPathSetting], dartDapPathValue);
-    });
+        final dartShim = File(
+          p.join(temp.path, '.vscode', 'xcross_dart_dap.dart'),
+        );
+        expect(dartShim.existsSync(), isTrue);
+        expect(
+          File(p.join(temp.path, '.vscode', 'xcross_dap.dart')).existsSync(),
+          isTrue,
+        );
+        final launch =
+            jsonDecode(
+                  File(
+                    p.join(temp.path, '.vscode', 'launch.json'),
+                  ).readAsStringSync(),
+                )
+                as Map;
+        final entry = (launch['configurations'] as List).single as Map;
+        expect(entry.containsKey('debuggerType'), isFalse);
+        final settings =
+            jsonDecode(
+                  File(
+                    p.join(temp.path, '.vscode', 'settings.json'),
+                  ).readAsStringSync(),
+                )
+                as Map;
+        expect(settings[dartDapPathSetting], dartDapPathValue);
+      },
+    );
 
     test('skips the Dart shim in plain Dart projects', () async {
       await VscodeCommand(
@@ -374,9 +369,7 @@ void main() {
       ).run();
 
       expect(
-        File(
-          p.join(temp.path, '.vscode', 'xcross_dart_dap.dart'),
-        ).existsSync(),
+        File(p.join(temp.path, '.vscode', 'xcross_dart_dap.dart')).existsSync(),
         isFalse,
       );
       final launch =

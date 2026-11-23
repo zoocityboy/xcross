@@ -1,8 +1,10 @@
 import 'dart:io';
 
-import 'package:cli_kit/cli_kit.dart';
+import 'package:cli_kit/shared/platform/platform_host.dart';
+import 'package:cli_kit/shared/process/process.dart';
+import 'package:meta/meta.dart';
 import 'package:path/path.dart' as p;
-import 'package:xcross/src/errors.dart';
+import 'package:xcross/src/shared/errors/errors.dart';
 
 /// Locates the DartNative iOS engine artifacts (`Flutter.xcframework`)
 /// inside the `dn` SDK.
@@ -11,10 +13,12 @@ import 'package:xcross/src/errors.dart';
 /// kernel format version only loads in the matching DN engine — never in a
 /// stock Flutter engine, whose Dart version differs. The engine ships with
 /// the `dn` SDK and is materialized by `dn precache --ios` (works on Linux).
-final class DnEngineCache {
-  DnEngineCache({required this.dnExecutable});
+@internal
+final class DnEngineCache<T extends PlatformHostInterface> {
+  DnEngineCache(this.dnExecutable, {required this.runner});
 
   final String dnExecutable;
+  final ProcessRunner<T> runner;
 
   /// The `dn` SDK root (`~/zero` for the documented install).
   String get dnRoot =>
@@ -51,12 +55,12 @@ final class DnEngineCache {
     ).existsSync()) {
       return;
     }
-    await Log.logStep(
+    await runner.log.logStep(
       'Precaching DartNative iOS engine',
-      () => ProcessRunner.runChecked(
+      () => runner.runChecked(
         dnExecutable,
         ['precache', '--ios'],
-        inheritStdio: Log.isVerbose,
+        inheritStdio: runner.log.isVerbose,
         label: 'dn',
       ),
     );

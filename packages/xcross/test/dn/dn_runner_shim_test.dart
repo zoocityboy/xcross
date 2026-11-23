@@ -1,12 +1,16 @@
 import 'dart:io';
 
+import 'package:darwin_sdk_kit/target/iphone/iphone_build_platform.dart';
 import 'package:path/path.dart' as p;
 import 'package:test/test.dart';
-import 'package:xcross/src/dn/dn_runner_shim.dart';
-import 'package:xcross/src/flutter/build/ios_deployment_target.dart';
+import 'package:xcross/src/composition/dn/dn_runner_shim.dart';
+import 'package:xcross/src/shared/swiftpm/ios_deployment_target.dart';
 
 void main() {
-  const deploymentTarget = IosDeploymentTarget('15.0');
+  const deploymentTarget = IosDeploymentTarget(
+    '15.0',
+    platform: IPhoneBuildPlatform(),
+  );
 
   group('DnRunnerShim.runnerObjcSource', () {
     test('boots the runtime delegate by its ObjC runtime name', () {
@@ -118,10 +122,7 @@ void main() {
           ),
         )..createSync(recursive: true);
         expect(DnRunnerShim.compilerRtIos(dir.path), rt.path);
-        expect(
-          DnRunnerShim.compilerRtIos(p.join(dir.path, 'missing')),
-          isNull,
-        );
+        expect(DnRunnerShim.compilerRtIos(p.join(dir.path, 'missing')), isNull);
       } finally {
         dir.deleteSync(recursive: true);
       }

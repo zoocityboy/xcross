@@ -2,11 +2,12 @@ import 'dart:io';
 
 import 'package:path/path.dart' as p;
 import 'package:test/test.dart';
-import 'package:xcross/src/cli/basic/doctor_project_checks.dart';
-import 'package:xcross/src/cli/dn/dn_command.dart';
-import 'package:xcross/src/cli/runner.dart';
-import 'package:xcross/src/dn/dn_app_resolver.dart';
-import 'package:xcross/src/dn/dn_project.dart';
+import 'package:xcross/src/composition/cli/dn_command.dart';
+import 'package:xcross/src/composition/cli/runner.dart';
+import 'package:xcross/src/composition/dn/dn_app_resolver.dart';
+import 'package:xcross/src/composition/dn/dn_project.dart';
+
+import '../cli/runtime_fixture.dart';
 
 void main() {
   group('DnProject', () {
@@ -17,7 +18,6 @@ void main() {
           'name: demo\ndependencies:\n  dartnative: ^1.0.0\n',
         );
         expect(DnProject.isDartNativeProject(dir.path), isTrue);
-        expect(DoctorProjectChecks.detect(dir.path)?.kind.name, 'dartnative');
       } finally {
         dir.deleteSync(recursive: true);
       }
@@ -65,12 +65,16 @@ void main() {
   });
 
   group('DnCommand registration', () {
-    test('runner exposes dn with build and run', () {
-      final runner = XcrossCli.buildRunner();
+    test('runner exposes dn with build, run and doctor', () {
+      final runner = XcrossCli.buildRunner(
+        testApplication(),
+        configTerminal: TestTerminal(),
+      );
       final dn = runner.commands['dn'];
       expect(dn, isA<DnCommand>());
       expect(dn!.subcommands.containsKey('build'), isTrue);
       expect(dn.subcommands.containsKey('run'), isTrue);
+      expect(dn.subcommands.containsKey('doctor'), isTrue);
     });
   });
 }

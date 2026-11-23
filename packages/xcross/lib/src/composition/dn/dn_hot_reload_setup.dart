@@ -1,14 +1,15 @@
 import 'dart:io';
 
-import 'package:cli_kit/cli_kit.dart';
+import 'package:meta/meta.dart';
 import 'package:path/path.dart' as p;
-import 'package:xcross/src/dn/dn_injected_defines.dart';
-import 'package:xcross/src/dn/dn_project.dart';
-import 'package:xcross/src/flutter/models/hot_reload_config.dart';
-import 'package:xcross/src/package_config_resolver.dart';
+import 'package:xcross/src/composition/dn/dn_context.dart';
+import 'package:xcross/src/composition/dn/dn_injected_defines.dart';
+import 'package:xcross/src/composition/dn/dn_project.dart';
+import 'package:xcross/src/shared/flutter/models/hot_reload_config.dart';
+import 'package:xcross/src/shared/packages/package_config_resolver.dart';
 
 /// Resolve hot-reload configuration for DartNative projects, mirroring
-/// [HotReloadSetup] but against the `dn` SDK instead of the Flutter SDK.
+/// `HotReloadSetup` but against the `dn` SDK instead of the Flutter SDK.
 ///
 /// The DN SDK layout mirrors Flutter's: `bin/cache/dart-sdk/bin/snapshots/`
 /// holds `frontend_server_aot.dart.snapshot`, `bin/cache/dart-sdk/bin` holds
@@ -17,6 +18,7 @@ import 'package:xcross/src/package_config_resolver.dart';
 /// compiled by DN's Dart fork, so incremental reloads must also run through
 /// DN's `frontend_server` — a stock Flutter one would emit an incompatible
 /// kernel version.
+@internal
 abstract final class DnHotReloadSetup {
   /// Resolve the paths a persistent DN `frontend_server` needs for hot reload.
   ///
@@ -27,15 +29,17 @@ abstract final class DnHotReloadSetup {
   /// scraped from the bundle build; they merge under explicit [dartDefines]
   /// so a restarted isolate boots with the same constants as the bundle.
   static Future<HotReloadConfig?> buildHotReloadConfig({
+    required DnContext context,
     required String target,
     required List<String> dartDefines,
     List<String> injectedDefines = const [],
     bool verbose = false,
   }) async {
-    final projectRoot = Directory.current.path;
+    final projectRoot = context.projectRoot;
+    final log = context.log;
     final dn = DnProject.resolveDnExecutable();
     if (dn == null) {
-      Log.logWarn('dn executable not found; hot reload disabled.');
+      log.logWarn('dn executable not found; hot reload disabled.');
       return null;
     }
     final dnRoot = p.dirname(p.dirname(File(dn).resolveSymbolicLinksSync()));
@@ -60,7 +64,7 @@ abstract final class DnHotReloadSetup {
       }
     }
     if (frontendServer == null) {
-      Log.logWarn(
+      log.logWarn(
         'dn frontend_server snapshot missing under $snapshotsDir; '
         'hot reload disabled.',
       );
@@ -77,14 +81,17 @@ abstract final class DnHotReloadSetup {
       'flutter_patched_sdk',
     );
     if (!Directory(sdkRoot).existsSync()) {
-      Log.logWarn(
+      log.logWarn(
         'dn patched SDK missing at $sdkRoot; hot reload disabled. '
         'Run `dn precache --ios` first.',
       );
       return null;
     }
 
-    final packageConfig = await PackageConfigResolver.require(projectRoot);
+    final packageConfig = await PackageConfigResolver(
+      fileSystem: context.host.fileSystem,
+      paths: context.paths,
+    ).require(projectRoot);
     final entrypoint = p.isAbsolute(target)
         ? target
         : p.join(projectRoot, target);
@@ -93,7 +100,7 @@ abstract final class DnHotReloadSetup {
     final isAot = p.basename(frontendServer).contains('_aot');
     final dart = p.join(
       dartSdkBin,
-      ProcessRunner.hostExecutableName(isAot ? 'dartaotruntime' : 'dart'),
+      context.runner.hostExecutableName(isAot ? 'dartaotruntime' : 'dart'),
     );
 
     final outputDill = p.join(

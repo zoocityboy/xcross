@@ -169,7 +169,9 @@ void main() {
           p.join(bin.path, Platform.isWindows ? 'dart.exe' : 'dart'),
         )..writeAsStringSync('#!/bin/sh\n');
         expect(
-          DapRouter.resolveDartExecutable({'dartSdkPath': sdk.path}),
+          DapRouter.resolveDartExecutable({
+            'dartSdkPath': sdk.path,
+          }, host: MacOSHost()),
           dart.path,
         );
       } finally {
@@ -178,12 +180,13 @@ void main() {
     });
 
     test('returns null without a usable SDK path', () {
-      expect(DapRouter.resolveDartExecutable(null), isNull);
-      expect(DapRouter.resolveDartExecutable({}), isNull);
+      final host = MacOSHost();
+      expect(DapRouter.resolveDartExecutable(null, host: host), isNull);
+      expect(DapRouter.resolveDartExecutable({}, host: host), isNull);
       expect(
         DapRouter.resolveDartExecutable({
           'dartSdkPath': p.join('no', 'such', 'sdk'),
-        }),
+        }, host: host),
         isNull,
       );
     });

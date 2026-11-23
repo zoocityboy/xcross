@@ -12,6 +12,7 @@ import 'package:darwin_sdk_kit/shared/errors/errors.dart';
 import 'package:meta/meta.dart';
 import 'package:xcross/src/composition/cli/cache_command.dart';
 import 'package:xcross/src/composition/cli/compose_command.dart';
+import 'package:xcross/src/composition/cli/dn_command.dart';
 import 'package:xcross/src/composition/cli/doctor_sections.dart';
 import 'package:xcross/src/composition/cli/flutter_command.dart';
 import 'package:xcross/src/composition/ios_target.dart';
@@ -52,7 +53,7 @@ abstract final class XcrossCli {
     final runner = XcrossRunner(
       runtime.log,
       'xcross',
-      'Build and run Flutter and Compose Multiplatform iOS apps without Xcode.',
+      'Build and run Flutter, DartNative, and Compose Multiplatform iOS apps without Xcode.',
     );
     final physical = composePhysicalFeatures(runtime);
     final environmentChecks = DoctorEnvironmentChecks(
@@ -99,6 +100,16 @@ abstract final class XcrossCli {
         doctorCommand: DoctorCommand(
           framework: 'Compose',
           sections: doctor.compose,
+          log: runtime.log,
+        ),
+      ),
+      DnCommand(
+        runtime,
+        pymd,
+        application.sockets,
+        doctorCommand: DoctorCommand(
+          framework: 'DartNative',
+          sections: doctor.dn,
           log: runtime.log,
         ),
       ),

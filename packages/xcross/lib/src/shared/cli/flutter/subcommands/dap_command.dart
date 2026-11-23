@@ -38,6 +38,10 @@ final class DapCommand extends Command<void> {
     output: runtime.output,
     errors: runtime.errors,
     testAdapter: argResults!.flag('test'),
+    dartShimmed:
+        '${runtime.runner.environmentValue(runtime.runner.effectiveEnvironment, 'XCROSS_DART_SHIM')}'
+            .toLowerCase() ==
+        'true',
     flutterAdapterArguments: argResults!.rest,
     flutterRoot: runtime.config.roots?.flutterSdk,
     environmentRoot:
